@@ -1,0 +1,6610 @@
+
+/* ===== v51b tags and advanced recurrence helpers ===== */
+function normaliseTags(value){
+  const source=Array.isArray(value)?value:String(value||'').split(',');
+  const seen=new Set();
+  return source.map(x=>String(x||'').trim()).filter(Boolean).filter(x=>{const k=x.toLocaleLowerCase();if(seen.has(k))return false;seen.add(k);return true;}).slice(0,20);
+}
+function tagsInputValue(item){return normaliseTags(item?.tags).join(', ');}
+function tagsMarkup(item){const tags=normaliseTags(item?.tags);return tags.length?`<div class="tag-row">${tags.map(tag=>`<span class="tag-chip">${escapeHtml(tag)}</span>`).join('')}</div>`:'';}
+/*
+ * My Life Planner v51b — advanced recurrence and tags build.
+ * Recurring tasks are added without changing the main saved-data key.
+ * Today's Focus is protected by migration recovery and a standalone safety mirror.
+ */
+var timelineRange='today';
+var TIMELINE_TYPES={
+  appointment:{icon:'📅',label:'Appointment'},todo:{icon:'✅',label:'To-do'},project:{icon:'📁',label:'Project'},
+  cleaning:{icon:'🧹',label:'Cleaning'},annual:{icon:'🎂',label:'Birthday / annual date'},waiting:{icon:'⏳',label:'Pending note'}
+};
+
+const dailyTasks = [];
+
+const eveningTasks = [];
+
+const defaultCategories = {};
+
+const categoryNames = {};
+
+const choicePools = { normal: [], low: [], quick: [] };
+
+const APP_VERSION="T1.0";
+const SCHEMA_VERSION = 51;
+const DATABASE_VERSION = "2";
+const MIGRATION_BACKUP_KEY = "lifePlannerMigrationBackups";
+const MIGRATION_LOG_KEY = "lifePlannerMigrationLog";
+
+function appendMigrationLog(entry) {
+  try {
+    const log = JSON.parse(localStorage.getItem(MIGRATION_LOG_KEY) || "[]");
+    const rows = Array.isArray(log) ? log : [];
+    rows.unshift({ at: new Date().toISOString(), ...entry });
+    localStorage.setItem(MIGRATION_LOG_KEY, JSON.stringify(rows.slice(0, 20)));
+  } catch (error) { console.warn("Could not write migration log", error); }
+}
+
+function createMigrationBackup(rawData, fromVersion, toVersion) {
+  const backup = {
+    id: `migration-${Date.now()}`,
+    savedAt: new Date().toISOString(),
+    fromVersion,
+    toVersion,
+    data: rawData
+  };
+  const existing = JSON.parse(localStorage.getItem(MIGRATION_BACKUP_KEY) || "[]");
+  const backups = Array.isArray(existing) ? existing : [];
+  backups.unshift(backup);
+  localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify(backups.slice(0, 5)));
+  return backup;
+}
+
+const DATA_MIGRATIONS = Object.freeze({
+  50: function migrate50To51(previous) {
+    return {
+      ...previous,
+      schemaVersion: 51,
+      migrationMeta: {
+        ...(previous.migrationMeta && typeof previous.migrationMeta === "object" ? previous.migrationMeta : {}),
+        lastMigratedAt: new Date().toISOString(),
+        lastMigration: "50-to-51"
+      }
+    };
+  }
+});
+
+function validatePlannerData(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error("Planner data is not an object");
+  const requiredLists = ["todos","projects","annualDates","cleaningTasks","appointments","recurringTasks","inbox","waiting","customLists","todayFocus"];
+  for (const field of requiredLists) if (!Array.isArray(candidate[field])) throw new Error(`Invalid ${field} collection`);
+  if (Number(candidate.schemaVersion) !== SCHEMA_VERSION) throw new Error("Schema version verification failed");
+  return true;
+}
+
+function migratePlannerData(rawData) {
+  const original = rawData && typeof rawData === "object" ? rawData : {};
+  let version = Number(original.schemaVersion);
+  if (!Number.isInteger(version) || version < 1) version = 50;
+  if (version > SCHEMA_VERSION) {
+    appendMigrationLog({ status:"blocked", fromVersion:version, toVersion:SCHEMA_VERSION, message:"Data is newer than this app" });
+    return normaliseData(original);
+  }
+  if (version === SCHEMA_VERSION) {
+    const current = normaliseData(original);
+    validatePlannerData(current);
+    return current;
+  }
+
+  const backup = createMigrationBackup(original, version, SCHEMA_VERSION);
+  let working = { ...original };
+  const startVersion = version;
+  try {
+    while (version < SCHEMA_VERSION) {
+      const migration = DATA_MIGRATIONS[version];
+      if (typeof migration !== "function") throw new Error(`No migration registered for schema ${version}`);
+      working = migration(working);
+      version += 1;
+    }
+    working = normaliseData(working);
+    validatePlannerData(working);
+    appendMigrationLog({ status:"success", fromVersion:startVersion, toVersion:SCHEMA_VERSION, backupId:backup.id });
+    return working;
+  } catch (error) {
+    appendMigrationLog({ status:"rollback", fromVersion:startVersion, toVersion:SCHEMA_VERSION, backupId:backup.id, message:String(error.message || error) });
+    console.error("Migration failed; original data retained", error);
+    const rollback = normaliseData(original);
+    rollback.schemaVersion = SCHEMA_VERSION;
+    rollback.migrationMeta = { ...(rollback.migrationMeta || {}), rollbackAt:new Date().toISOString(), rollbackReason:String(error.message || error) };
+    return rollback;
+  }
+}
+
+function normaliseLegacyShape(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...source,
+    todos: source.todos || source.todoItems || source.tasks || [],
+    projects: source.projects || source.projectItems || [],
+    annualDates: source.annualDates || source.birthdays || source.annualReminders || [],
+    cleaningTasks: source.cleaningTasks || source.cleaning || source.cleaningJobs || source.householdTasks || [],
+    appointments: source.appointments || source.events || [],
+    customLists: Array.isArray(source.customLists) ? source.customLists : [],
+    todayFocus: Array.isArray(source.todayFocus) ? source.todayFocus : []
+  };
+}
+
+function scoreData(candidate = {}) {
+  const shaped = normaliseLegacyShape(candidate);
+  return [
+    shaped.todos, shaped.projects, shaped.annualDates, shaped.cleaningTasks, shaped.appointments,
+    shaped.recurringTasks, shaped.inbox, shaped.waiting, shaped.customLists, shaped.todayFocus
+  ].reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0);
+}
+
+function mergeUniqueLists(candidates, field) {
+  const result = [];
+  const seen = new Set();
+  candidates.forEach(candidate => {
+    const shaped = normaliseLegacyShape(candidate.value);
+    (shaped[field] || []).forEach(item => {
+      const signature = item.id || `${item.name || item.title || ""}|${item.dueDate || item.nextDue || item.monthDay || ""}`;
+      if (!seen.has(signature)) { seen.add(signature); result.push(item); }
+    });
+  });
+  return result;
+}
+
+function addCandidate(candidates, key, priority, value) {
+  if (!value || typeof value !== "object") return;
+  const shaped = normaliseLegacyShape(value);
+  if (scoreData(shaped) || key === "lifePlannerData") {
+    candidates.push({ key, priority, value: normaliseData(shaped) });
+  }
+}
+
+function getData() {
+  const keys = ["lifePlannerData", "lifePlannerDataV9", "lifePlannerDataV8A", "lifePlannerDataV8", "lifePlannerDataV7", "lifePlannerDataV6", "lifePlannerDataV5", "lifePlannerDataV4", "lifePlannerDataV3"];
+  const candidates = [];
+  keys.forEach((key, priority) => {
+    const saved = localStorage.getItem(key);
+    if (!saved) return;
+    try { addCandidate(candidates, key, priority, JSON.parse(saved)); }
+    catch (error) { console.warn("Could not read", key, error); }
+  });
+
+  // v50 correction: perform a fresh rescue pass even when an older migration marker exists.
+  // This recovers Today's Focus entries from safety copies or daily backups before v50 writes.
+  if (!localStorage.getItem("lifePlannerMigrationV50FocusDone")) {
+    try {
+      const safety = JSON.parse(localStorage.getItem("lifePlannerMigrationSafety") || "null");
+      if (safety?.data) addCandidate(candidates, "migrationSafety", 20, safety.data);
+    } catch {}
+    ["lifePlannerDailyBackups", "lifePlannerDailyBackupsV9"].forEach((key, keyIndex) => {
+      try {
+        const copies = JSON.parse(localStorage.getItem(key) || "[]");
+        if (Array.isArray(copies)) copies.forEach((copy, index) => {
+          let snapshot = copy?.data;
+          if (typeof snapshot === "string") { try { snapshot = JSON.parse(snapshot); } catch { snapshot = null; } }
+          if (snapshot) addCandidate(candidates, `${key}:${copy.date || index}`, 30 + keyIndex, snapshot);
+        });
+      } catch {}
+    });
+    try {
+      const focusMirror = JSON.parse(localStorage.getItem("lifePlannerTodayFocus") || "[]");
+      if (Array.isArray(focusMirror) && focusMirror.length) addCandidate(candidates, "todayFocusMirror", 15, {todayFocus:focusMirror});
+    } catch {}
+  }
+
+  if (!candidates.length) return migratePlannerData({});
+  candidates.sort((a,b) => a.priority-b.priority);
+  const preferred = candidates[0].value;
+  const mergedLegacyData = {
+    ...preferred,
+    todos: mergeUniqueLists(candidates,"todos"),
+    projects: mergeUniqueLists(candidates,"projects"),
+    annualDates: mergeUniqueLists(candidates,"annualDates"),
+    cleaningTasks: mergeUniqueLists(candidates,"cleaningTasks"),
+    appointments: mergeUniqueLists(candidates,"appointments"),
+    recurringTasks: mergeUniqueLists(candidates,"recurringTasks"),
+    inbox: mergeUniqueLists(candidates,"inbox"),
+    waiting: mergeUniqueLists(candidates,"waiting"),
+    customLists: mergeUniqueLists(candidates,"customLists"),
+    todayFocus: mergeUniqueLists(candidates,"todayFocus")
+  };
+  const merged = migratePlannerData(mergedLegacyData);
+  try {
+    localStorage.setItem("lifePlannerMigrationSafety", JSON.stringify({savedAt:new Date().toISOString(), sourceKeys:candidates.map(x=>x.key), data:merged}));
+    localStorage.setItem("lifePlannerData", JSON.stringify(merged));
+    localStorage.setItem("lifePlannerMigrationV93Done", new Date().toISOString());
+    localStorage.setItem("lifePlannerMigrationV50FocusDone", new Date().toISOString());
+    localStorage.setItem("lifePlannerTodayFocus", JSON.stringify(merged.todayFocus || []));
+  } catch {}
+  return merged;
+}
+
+let data = getData();
+
+const DATA_KEY = "lifePlannerData";
+const LEGACY_DATA_KEYS = ["lifePlannerDataV9","lifePlannerDataV8A","lifePlannerDataV8","lifePlannerDataV7","lifePlannerDataV6","lifePlannerDataV5","lifePlannerDataV4","lifePlannerDataV3"];
+const RECOVERY_KEY = "lifePlannerDailyBackups";
+const LEGACY_RECOVERY_KEYS = ["lifePlannerDailyBackupsV9"];
+const SETTINGS_KEY = "lifePlannerSettings";
+const LEGACY_SETTINGS_KEYS = ["lifePlannerSettingsV9","lifePlannerSettingsV8","lifePlannerSettingsV7"];
+const MODULE_VERSIONS = Object.freeze({
+  brainCapture: "2.1",
+  attachments: "1.1",
+  appointments: "2.0",
+  quickActions: "1.0",
+  recurringTasks: "1.0"
+});
+let saveIndicatorTimer = null;
+
+function normaliseData(loaded = {}) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    migrationMeta: loaded.migrationMeta && typeof loaded.migrationMeta === "object" ? loaded.migrationMeta : {},
+    todos: Array.isArray(loaded.todos) ? loaded.todos : [],
+    projects: Array.isArray(loaded.projects) ? loaded.projects : [],
+    annualDates: Array.isArray(loaded.annualDates) ? loaded.annualDates : [],
+    cleaningTasks: Array.isArray(loaded.cleaningTasks) ? loaded.cleaningTasks : Array.isArray(loaded.cleaning) ? loaded.cleaning : Array.isArray(loaded.cleaningJobs) ? loaded.cleaningJobs : [],
+    appointments: Array.isArray(loaded.appointments) ? loaded.appointments : [],
+    recurringTasks: Array.isArray(loaded.recurringTasks) ? loaded.recurringTasks : [],
+    inbox: Array.isArray(loaded.inbox) ? loaded.inbox : [],
+    waiting: Array.isArray(loaded.waiting) ? loaded.waiting : [],
+    customLists: Array.isArray(loaded.customLists) ? loaded.customLists.map(list => ({...list, items:Array.isArray(list.items)?list.items:[]})) : [],
+    todayFocus: Array.isArray(loaded.todayFocus) ? loaded.todayFocus : [],
+    dailyTasks: Array.isArray(loaded.dailyTasks) ? loaded.dailyTasks : JSON.parse(JSON.stringify(dailyTasks)),
+    eveningTasks: Array.isArray(loaded.eveningTasks) ? loaded.eveningTasks : JSON.parse(JSON.stringify(eveningTasks)),
+    categoryTasks: loaded.categoryTasks && typeof loaded.categoryTasks === "object"
+      ? loaded.categoryTasks : JSON.parse(JSON.stringify(defaultCategories))
+  };
+}
+
+function localDateKey(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function collectChecks() {
+  return Object.fromEntries(
+    Object.keys(localStorage)
+      .filter(key => key.startsWith("lifePlanner:"))
+      .map(key => [key, localStorage.getItem(key)])
+  );
+}
+
+function createRecoveryCopy(serialised) {
+  try {
+    const today = localDateKey();
+    let rawRecovery = localStorage.getItem(RECOVERY_KEY);
+    if (!rawRecovery) { for (const key of LEGACY_RECOVERY_KEYS) { rawRecovery = localStorage.getItem(key); if (rawRecovery) break; } }
+    let copies = JSON.parse(rawRecovery || "[]");
+    if (!Array.isArray(copies)) copies = [];
+    const snapshot = {
+      date: today,
+      savedAt: new Date().toISOString(),
+      data: serialised,
+      checks: collectChecks(),
+      settings: getSettings()
+    };
+    const existing = copies.findIndex(copy => copy.date === today);
+    if (existing >= 0) copies[existing] = snapshot;
+    else copies.push(snapshot);
+    copies.sort((a,b) => String(b.date).localeCompare(String(a.date)));
+    localStorage.setItem(RECOVERY_KEY, JSON.stringify(copies.slice(0, 5)));
+  } catch (error) {
+    console.warn("Could not create daily backup", error);
+  }
+}
+
+function showSaved(message = "Saved on this device") {
+  const indicator = document.getElementById("saveIndicator");
+  if (!indicator) return;
+  indicator.textContent = message;
+  indicator.classList.add("saved");
+  clearTimeout(saveIndicatorTimer);
+  saveIndicatorTimer = setTimeout(() => indicator.classList.remove("saved"), 1800);
+}
+
+function saveData() {
+  try {
+    data = normaliseData(data);
+    validatePlannerData(data);
+    const serialised = JSON.stringify(data);
+    createRecoveryCopy(serialised);
+    localStorage.setItem(DATA_KEY, serialised);
+    // Keep a small independent mirror so quick one-offs survive future migrations.
+    localStorage.setItem("lifePlannerTodayFocus", JSON.stringify(data.todayFocus || []));
+    updateStorageStatus();
+    showSaved();
+  } catch (error) {
+    console.error("Could not save planner data", error);
+    const indicator = document.getElementById("saveIndicator");
+    if (indicator) indicator.textContent = "Save failed — export a backup";
+    alert("The planner could not save. Please use Export backup and check that Safari is not in Private Browsing.");
+  }
+}
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function storageKey(group, id) {
+  return `lifePlanner:${group}:${id}`;
+}
+
+function dateOnly(value) {
+  if (!value) return null;
+  const date = new Date(value + "T12:00:00");
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatDate(value, includeYear = true) {
+  const date = dateOnly(value);
+  if (!date) return "";
+  const weekday = date.toLocaleDateString("en-GB", { weekday: "short" });
+  const day = String(date.getDate()).padStart(2,"0");
+  const month = String(date.getMonth()+1).padStart(2,"0");
+  const year = String(date.getFullYear()).slice(-2);
+  return includeYear ? `${weekday} ${day}-${month}-${year}` : `${weekday} ${day}-${month}`;
+}
+
+function daysBetween(from, to) {
+  const day = 86400000;
+  return Math.ceil((to - from) / day);
+}
+
+function nextAnnualOccurrence(monthDay) {
+  if (!monthDay) return null;
+  const [month, day] = monthDay.split("-").map(Number);
+  const today = new Date();
+  today.setHours(12,0,0,0);
+  let result = new Date(today.getFullYear(), month - 1, day, 12);
+  if (result < today) result = new Date(today.getFullYear() + 1, month - 1, day, 12);
+  return result;
+}
+
+function getTimingText(item) {
+  if (item.timingType === "ongoing") return "Ongoing";
+  if (item.dueDate) return `Due ${formatDate(item.dueDate)}`;
+  return "No deadline";
+}
+
+function getBadge(item) {
+  if (item.timingType === "ongoing") return { text: "Ongoing", cls: "ongoing" };
+  if (!item.dueDate) return { text: "No date", cls: "" };
+  const today = new Date(); today.setHours(12,0,0,0);
+  const days = daysBetween(today, dateOnly(item.dueDate));
+  if (days < 0) return { text: `Overdue by ${Math.abs(days)} day${Math.abs(days) === 1 ? "" : "s"}`, cls: "overdue" };
+  if (days === 0) return { text: "Due today", cls: "due" };
+  return { text: `Due in ${days} day${days === 1 ? "" : "s"}`, cls: "due" };
+}
+
+function createTaskRow(task, group, editable = false) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "editable-task";
+
+  const label = document.createElement("label");
+  label.className = "task-row";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = localStorage.getItem(storageKey(group, task.id)) === "true";
+  const copy = document.createElement("span");
+  copy.className = "task-copy";
+  copy.innerHTML = `<span class="task-title">${escapeHtml(task.title)}</span><span class="task-time">${escapeHtml(task.time || "")}</span>`;
+  label.append(checkbox, copy);
+
+  function refresh() { label.classList.toggle("completed", checkbox.checked); }
+  checkbox.addEventListener("change", () => {
+    localStorage.setItem(storageKey(group, task.id), checkbox.checked);
+    refresh();
+    updateProgress();
+  });
+  refresh();
+  wrapper.appendChild(label);
+
+  if (editable) {
+    const actions = document.createElement("div");
+    actions.className = "mini-actions";
+    actions.innerHTML = `
+      <button type="button" class="small-button" onclick="editRoutineTask('${group}','${task.id}')">Edit</button>
+      <button type="button" class="small-button danger-button" onclick="deleteRoutineTask('${group}','${task.id}')">Delete</button>`;
+    wrapper.appendChild(actions);
+  }
+  return wrapper;
+}
+
+function renderChecklist(containerId, tasks, group, editable = false) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = "";
+  if (!tasks.length) {
+    container.innerHTML = `<div class="empty-state">No tasks yet. Use Add task.</div>`;
+    return;
+  }
+  tasks.forEach(task => container.appendChild(createTaskRow(task, group, editable)));
+}
+
+function updateProgress() {
+  const routineChecks = [...document.querySelectorAll("#dailyChecklist input, #eveningChecklist input")];
+  const routineCompleted = routineChecks.filter(item => item.checked).length;
+  const todos = Array.isArray(data.todos) ? data.todos : [];
+  const completed = routineCompleted + todos.filter(item => item.completed).length;
+  const total = routineChecks.length + todos.length;
+  const percent = total ? Math.round(completed / total * 100) : 0;
+  const bar = document.getElementById("progressBar");
+  const text = document.getElementById("progressText");
+  if (bar) bar.style.width = `${percent}%`;
+  if (text) text.textContent = `${completed} of ${total}`;
+}
+
+function setDate() {
+  document.getElementById("todayDate").textContent = new Date().toLocaleDateString("en-GB", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric"
+  });
+}
+
+function resetDailyTasks() {
+  if (!confirm("Untick all Daily Rhythm and evening tasks for today?")) return;
+  [...data.dailyTasks, ...data.eveningTasks].forEach(task => localStorage.removeItem(storageKey("daily", task.id)));
+  renderAll();
+  showSaved("Today reset");
+}
+
+function savedChoiceItems() {
+  return [
+    ...data.todos.filter(x => !x.completed).map(x => x.name),
+    ...data.projects.filter(x => !x.completed).map(x => x.name),
+    ...data.projects.flatMap(p => p.steps.filter(s => !s.completed && !s.pending).map(s => s.name)),
+    ...Object.values(data.categoryTasks || {}).flat(),
+    ...data.cleaningTasks.filter(x => isDueTodayOrEarlier(x.nextDue)).map(x => x.name)
+  ].filter(Boolean);
+}
+
+function chooseFrom(poolName) {
+  const pool = [...new Set(savedChoiceItems().filter(Boolean))];
+  const card = document.getElementById("choiceCard");
+  if (!pool.length) { card.textContent = "There are no available saved tasks yet. Add one to a list first."; return; }
+  const shuffled = [...pool].sort(() => Math.random() - 0.5).slice(0, Math.min(3, pool.length));
+  card.innerHTML = `<ol class="choice-list">${shuffled.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ol><button type="button" class="small-button" onclick="chooseFrom('${poolName}')">Give me three different saved tasks</button>`;
+}
+
+function chooseForMe() { chooseFrom("normal"); }
+function chooseLowEnergy() { chooseFrom("low"); }
+function chooseQuickWin() { chooseFrom("quick"); }
+
+let lastHelpfulChoiceKey = '';
+function helpfulCandidates(mode='extra') {
+  const items = [
+    ...data.todos.filter(x=>!x.completed).map(x=>({key:`todo:${x.id}`,label:x.name,detail:x.dueDate?getTimingText(x):'To-do',open:()=>editTodo(x.id),priority:x.dueDate?0:3})),
+    ...data.projects.filter(x=>!x.completed).flatMap(p=>{
+      const s=(p.steps||[]).find(x=>!x.completed && !x.pending);
+      return s?[{key:`step:${p.id}:${s.id}`,label:s.name,detail:`Project: ${p.name}`,open:()=>editStep(p.id,s.id),priority:s.dueDate?0:2}]:[{key:`project:${p.id}`,label:`Review ${p.name}`,detail:'Project without a next step',open:()=>editProject(p.id),priority:4}];
+    }),
+    ...data.cleaningTasks.filter(x=>!x.completed).map(x=>({key:`clean:${x.id}`,label:x.name,detail:`Cleaning · ${x.room||'Home'}`,open:()=>editCleaning(x.id),priority:isDueTodayOrEarlier(x.nextDue)?0:5}))
+  ];
+  let pool=items.filter(x=>x.key!==lastHelpfulChoiceKey);
+  if(!pool.length) pool=items;
+  if(mode==='useful') pool=pool.sort((a,b)=>a.priority-b.priority).slice(0,Math.max(3,Math.ceil(pool.length/2)));
+  if(mode==='extra') pool=pool.filter(x=>x.priority>=2 || !x.detail.includes('Project')) || pool;
+  return pool;
+}
+function chooseHelpfulTask(mode='extra'){
+  const result=document.getElementById('helpfulChoiceResult')||document.getElementById('dailyDecisionResult');
+  const pool=helpfulCandidates(mode);
+  if(!pool.length){result.classList.remove('hidden');result.textContent='Add a to-do, project, cleaning task or routine item first.';return;}
+  const item=pool[Math.floor(Math.random()*pool.length)]; lastHelpfulChoiceKey=item.key;
+  result.classList.remove('hidden');result.innerHTML=`<strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(item.detail)}</span>${item.open?'<button type="button" class="small-button" id="helpfulOpenButton">Open</button>':''}`;
+  if(item.open) document.getElementById('helpfulOpenButton').onclick=item.open;
+}
+function decideDailyTask(){ chooseHelpfulTask('extra'); }
+
+
+function showCategory(categoryKey) {
+  const area = document.getElementById("categoryArea");
+  area.innerHTML = `<h3>${categoryNames[categoryKey]}</h3>`;
+  const list = document.createElement("div");
+  list.className = "checklist";
+  (data.categoryTasks[categoryKey] || []).forEach((taskText, index) => {
+    list.appendChild(createTaskRow({ id: `${categoryKey}-${index}`, title: taskText, time: "Tick when completed" }, `category:${categoryKey}`));
+  });
+  area.appendChild(list);
+}
+
+
+
+
+function togglePanel(areaId, buttonId) {
+  const area = document.getElementById(areaId);
+  const button = document.getElementById(buttonId);
+  if (!area || !button) return;
+  const hidden = area.classList.toggle("collapsed-content");
+  button.textContent = hidden ? "Show" : "Hide";
+  localStorage.setItem(`lifePlannerPanel:${areaId}`, hidden ? "hidden" : "shown");
+}
+
+function restorePanelStates() {
+  [["todayRemindersArea","todayToggle"],["weeklyArea","weekToggle"]].forEach(([areaId,buttonId]) => {
+    const hidden = localStorage.getItem(`lifePlannerPanel:${areaId}`) === "hidden";
+    const area = document.getElementById(areaId);
+    const button = document.getElementById(buttonId);
+    if (area) area.classList.toggle("collapsed-content", hidden);
+    if (button) button.textContent = hidden ? "Show" : "Hide";
+  });
+}
+
+let managedRoutineGroup = "daily";
+const routineManagerDialog = document.getElementById("routineManagerDialog");
+
+function openRoutineManager(group) {
+  managedRoutineGroup = group;
+  document.getElementById("routineManagerTitle").textContent = group === "evening" ? "Manage Gentle close-down" : "Manage Daily rhythm";
+  document.getElementById("routineNewName").value = "";
+  document.getElementById("routineNewTime").value = "";
+  renderRoutineManager();
+  routineManagerDialog.showModal();
+}
+
+function closeRoutineManager() { routineManagerDialog.close(); }
+
+function renderRoutineManager() {
+  const area = document.getElementById("routineManagerList");
+  const list = routineList(managedRoutineGroup);
+  area.innerHTML = "";
+  if (!list.length) {
+    area.innerHTML = '<div class="empty-state">Nothing here yet. Add the first item when you are ready.</div>';
+    return;
+  }
+  list.forEach(item => {
+    const row = document.createElement("div");
+    row.className = "manager-row";
+    const index = list.findIndex(entry => entry.id === item.id);
+    row.innerHTML = `<div><strong>${escapeHtml(item.title)}</strong>${item.time ? `<div class="card-meta">${escapeHtml(item.time)}</div>` : ""}</div>
+      <div class="mini-actions routine-manager-actions">
+        <button type="button" class="small-button" onclick="moveRoutineInManager('${item.id}',-1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeHtml(item.title)} up">↑</button>
+        <button type="button" class="small-button" onclick="moveRoutineInManager('${item.id}',1)" ${index === list.length - 1 ? 'disabled' : ''} aria-label="Move ${escapeHtml(item.title)} down">↓</button>
+        <button type="button" class="small-button" onclick="editRoutineInManager('${item.id}')">Edit</button>
+        <button type="button" class="small-button danger-button" onclick="deleteRoutineInManager('${item.id}')">Delete</button>
+      </div>`;
+    area.appendChild(row);
+  });
+}
+
+function addRoutineFromManager() {
+  const nameInput = document.getElementById("routineNewName");
+  const timeInput = document.getElementById("routineNewTime");
+  const title = nameInput.value.trim();
+  if (!title) { nameInput.focus(); return; }
+  routineList(managedRoutineGroup).push({ id: uid(), title, time: timeInput.value.trim() });
+  saveData();
+  nameInput.value = "";
+  timeInput.value = "";
+  renderRoutineManager();
+  renderAll();
+}
+
+
+function moveRoutineInManager(id, direction) {
+  const list = routineList(managedRoutineGroup);
+  const index = list.findIndex(item => item.id === id);
+  const nextIndex = index + Number(direction);
+  if (index < 0 || nextIndex < 0 || nextIndex >= list.length) return;
+  [list[index], list[nextIndex]] = [list[nextIndex], list[index]];
+  saveData();
+  renderRoutineManager();
+  renderAll();
+}
+
+function editRoutineInManager(id) {
+  const item = routineList(managedRoutineGroup).find(x => x.id === id);
+  if (!item) return;
+  const title = prompt("Edit item", item.title);
+  if (title === null || !title.trim()) return;
+  const note = prompt("Edit note or time", item.time || "");
+  if (note === null) return;
+  item.title = title.trim();
+  item.time = note.trim();
+  saveData();
+  renderRoutineManager();
+  renderAll();
+}
+
+function deleteRoutineInManager(id) {
+  const item = routineList(managedRoutineGroup).find(x => x.id === id);
+  if (!item || !confirm(`Delete "${item.title}"?`)) return;
+  if (managedRoutineGroup === "evening") data.eveningTasks = data.eveningTasks.filter(x => x.id !== id);
+  else data.dailyTasks = data.dailyTasks.filter(x => x.id !== id);
+  localStorage.removeItem(storageKey("daily", id));
+  saveData();
+  renderRoutineManager();
+  renderAll();
+}
+
+function routineList(group) {
+  return group === "evening" ? data.eveningTasks : data.dailyTasks;
+}
+
+function editRoutineTask(group, id) {
+  const item = routineList(group).find(x => x.id === id);
+  if (!item) return;
+  clearForm();
+  itemType.value = group;
+  document.getElementById("editingId").value = item.id;
+  document.getElementById("itemName").value = item.title || "";
+  document.getElementById("itemDetails").value = item.time || "";
+  document.getElementById("dialogTitle").textContent = group === "evening" ? "Edit evening task" : "Edit daily task";
+  updateFormVisibility();
+  dialog.showModal();
+}
+
+function deleteRoutineTask(group, id) {
+  const list = routineList(group);
+  const item = list.find(x => x.id === id);
+  if (!item) return;
+  if (!confirm(`Delete "${item.title}"?`)) return;
+  if (group === "evening") data.eveningTasks = list.filter(x => x.id !== id);
+  else data.dailyTasks = list.filter(x => x.id !== id);
+  localStorage.removeItem(storageKey("daily", id));
+  saveData();
+  renderAll();
+}
+
+function updateStorageStatus() {
+  const status = document.getElementById("storageStatus");
+  if (!status) return;
+  const saved = localStorage.getItem(DATA_KEY) || LEGACY_DATA_KEYS.map(key => localStorage.getItem(key)).find(Boolean);
+  let recoveries = 0;
+  try { recoveries = JSON.parse(localStorage.getItem(RECOVERY_KEY) || "[]").length; } catch {}
+  status.textContent = saved
+    ? `Saved privately on this device (${Math.max(1, Math.round(new Blob([saved]).size / 1024))} KB) · ${recoveries} daily backup${recoveries === 1 ? "" : "s"}.`
+    : "No planner information has been saved yet.";
+}
+
+function exportPlanner() {
+  saveData();
+  const backup = {
+    app: "My Life Planner",
+    version: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    data,
+    checks: collectChecks(),
+    settings: getSettings()
+  };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `my-life-planner-backup-${new Date().toISOString().slice(0,10)}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+async function sharePlannerBackup() {
+  saveData();
+  const backup = {
+    app: "My Life Planner",
+    version: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    data,
+    checks: collectChecks(),
+    settings: getSettings()
+  };
+  const file = new File([JSON.stringify(backup, null, 2)],
+    `my-life-planner-backup-${new Date().toISOString().slice(0,10)}.json`,
+    { type: "application/json" });
+
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ title: "My Life Planner backup", text: "A backup of my planner information.", files: [file] });
+      showSaved("Backup shared");
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+    }
+  }
+  exportPlanner();
+}
+
+function getDailyBackups() {
+  try {
+    const copies = JSON.parse(localStorage.getItem(RECOVERY_KEY) || "[]");
+    return Array.isArray(copies) ? copies : [];
+  } catch { return []; }
+}
+
+function renderDailyBackups() {
+  const area = document.getElementById("dailyBackupsArea");
+  if (!area) return;
+  const copies = getDailyBackups();
+  area.innerHTML = "";
+  if (!copies.length) {
+    area.innerHTML = '<div class="empty-state">Your first dated backup will appear after the planner saves.</div>';
+    return;
+  }
+  copies.forEach(copy => {
+    const row = document.createElement("div");
+    row.className = "backup-row";
+    const date = new Date(`${copy.date}T12:00:00`).toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short", year:"numeric" });
+    const time = new Date(copy.savedAt).toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+    row.innerHTML = `<div><strong>${escapeHtml(date)}</strong><div class="card-meta">Latest save at ${escapeHtml(time)}</div></div><button type="button" class="small-button">Restore</button>`;
+    row.querySelector("button").addEventListener("click", () => restoreDailyBackup(copy.date));
+    area.appendChild(row);
+  });
+}
+
+function restoreDailyBackup(dateKey) {
+  const copy = getDailyBackups().find(item => item.date === dateKey);
+  if (!copy) return alert("That daily backup is no longer available.");
+  const label = new Date(`${dateKey}T12:00:00`).toLocaleDateString("en-GB", { day:"numeric", month:"long", year:"numeric" });
+  if (!confirm(`Restore the backup from ${label}? A safety copy of your current planner will be made first.`)) return;
+  try {
+    createRecoveryCopy(JSON.stringify(data));
+    data = normaliseData(JSON.parse(copy.data));
+    localStorage.setItem(DATA_KEY, JSON.stringify(data));
+    Object.entries(copy.checks || {}).forEach(([key,value]) => localStorage.setItem(key,value));
+    if (copy.settings) localStorage.setItem(SETTINGS_KEY, JSON.stringify(copy.settings));
+    applySettings();
+    renderAll();
+    showSaved("Daily backup restored");
+  } catch { alert("That daily backup could not be restored."); }
+}
+
+function restoreLatestRecovery() {
+  const latest = getDailyBackups()[0];
+  if (!latest) return alert("There is no daily backup available yet.");
+  restoreDailyBackup(latest.date);
+}
+
+function importPlanner(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const raw = String(reader.result || "").replace(/^\uFEFF/, "").trim();
+      if (!raw) throw new Error("Backup file is empty");
+      if (raw.startsWith("PK")) throw new Error("ZIP selected instead of planner JSON backup");
+      const backup = JSON.parse(raw);
+      const imported = backup.data || backup;
+      if (!imported || typeof imported !== "object" || Array.isArray(imported)) throw new Error("Invalid backup structure");
+      data = normaliseData(imported);
+      Object.entries(backup.checks || {}).forEach(([key, value]) => localStorage.setItem(key, value));
+      if (backup.settings) localStorage.setItem(SETTINGS_KEY, JSON.stringify(backup.settings));
+      applySettings();
+      saveData();
+      renderAll();
+      alert("Planner backup imported successfully.");
+    } catch (error) {
+      console.error("Backup import failed", error);
+      const message = String(error?.message || "");
+      if (message.includes("ZIP selected")) alert("That is the app ZIP, not a planner backup. Choose the .json file created by Backup / Export.");
+      else alert("That file could not be read as a My Life Planner backup. Please choose the .json backup created by the planner.");
+    } finally {
+      event.target.value = "";
+    }
+  };
+  reader.readAsText(file);
+}
+
+let deferredInstallPrompt = null;
+window.addEventListener("beforeinstallprompt", event => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  document.getElementById("installButton")?.classList.remove("hidden");
+});
+
+async function installPlanner() {
+  if (!deferredInstallPrompt) {
+    alert("On iPhone or iPad, open the Share menu and choose Add to Home Screen. On Android, use the browser menu and choose Install app.");
+    return;
+  }
+  deferredInstallPrompt.prompt();
+  await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  const installButton = document.getElementById("installButton");
+  if (installButton) installButton.textContent = "Install app";
+}
+
+function frequencyLabel(value) {
+  return {
+    daily: "Daily",
+    weekly: "Weekly",
+    fortnightly: "Every two weeks",
+    monthly: "Monthly"
+  }[value] || value;
+}
+
+function nextCleaningDate(currentDate, frequency) {
+  const base = currentDate ? dateOnly(currentDate) : new Date();
+  const next = new Date(base);
+  if (frequency === "daily") next.setDate(next.getDate() + 1);
+  if (frequency === "weekly") next.setDate(next.getDate() + 7);
+  if (frequency === "fortnightly") next.setDate(next.getDate() + 14);
+  if (frequency === "monthly") next.setMonth(next.getMonth() + 1);
+  return next.toISOString().slice(0, 10);
+}
+
+function isDueTodayOrEarlier(value) {
+  if (!value) return false;
+  const today = new Date();
+  today.setHours(12,0,0,0);
+  return dateOnly(value) <= today;
+}
+
+function openCleaningDialog() {
+  openAddDialog("cleaning");
+}
+
+
+function deleteCleaning(id) {
+  data.cleaningTasks = data.cleaningTasks.filter(item => item.id !== id);
+  saveData();
+  renderAll();
+}
+
+function editCleaning(id) {
+  const item = data.cleaningTasks.find(x => x.id === id);
+  if (!item) return;
+  clearForm();
+  itemType.value = "cleaning";
+  document.getElementById("editingId").value = item.id;
+  document.getElementById("itemName").value = item.name || "";
+  document.getElementById("itemDetails").value = item.details || "";
+  document.getElementById("cleaningRoom").value = item.room || "";
+  document.getElementById("cleaningFrequency").value = item.frequency || "weekly";
+  document.getElementById("cleaningStartDate").value = item.nextDue || "";
+  document.getElementById("dialogTitle").textContent = "Edit cleaning task";
+  updateFormVisibility();
+  dialog.showModal();
+}
+
+function renderCleaningToday() {
+  const area = document.getElementById("cleaningTodayArea");
+  if (!area) return;
+  const items = getWeeklyItems().filter(item => !item.annual && item.itemType !== "annual");
+  area.innerHTML = "";
+  if (!items.length) { area.innerHTML = `<div class="empty-state">No actionable tasks are due within the next week.</div>`; return; }
+  items.forEach(item => {
+    let onComplete = null;
+    if (item.itemType === "cleaning") onComplete = () => completeCleaning(item.id);
+    if (item.itemType === "todo") onComplete = () => toggleTodo(item.id);
+    if (item.itemType === "project") onComplete = () => toggleProject(item.id);
+    if (item.itemType === "step") onComplete = () => toggleStep(item.parentId,item.id);
+    const meta = `${item.source} · ${getTimingText(item)}`;
+    area.appendChild(compactReminderRow(item,{meta,actionable:true,onComplete,clickable:true}));
+  });
+}
+
+
+
+
+
+function annualStatus(item) {
+  const occurrence = nextAnnualOccurrence(item.monthDay);
+  if (!occurrence) return null;
+
+  const today = new Date();
+  today.setHours(12,0,0,0);
+  const days = daysBetween(today, occurrence);
+  const reminderDays = Number(item.reminderDays || 7);
+
+  return {
+    occurrence,
+    days,
+    reminderDays,
+    isToday: days === 0,
+    inReminderWindow: days >= 0 && days <= reminderDays
+  };
+}
+
+
+
+
+function compactReminderRow(item, options = {}) {
+  const row = document.createElement("div");
+  const overdue = item.dueDate && dateOnly(item.dueDate) < new Date(new Date().setHours(0,0,0,0));
+  row.className = `compact-reminder-row${options.clickable ? " clickable-reminder" : ""}${overdue ? " overdue-row" : ""}`;
+  const actionable = options.actionable;
+  const icon = item.itemType === "annual" ? "🎂" : "";
+  const control = actionable ? `<input type="checkbox" aria-label="Complete ${escapeHtml(item.name)}">` : `<span class="compact-icon">${icon}</span>`;
+  row.innerHTML = `${control}<div class="compact-copy"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(options.meta || "")}</span></div>${options.badge ? `<span class="compact-badge">${escapeHtml(options.badge)}</span>` : ""}`;
+  if (actionable) row.querySelector("input").addEventListener("change", event => { event.stopPropagation(); options.onComplete?.(); });
+  if (options.clickable) {
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-label", `Open ${item.name}`);
+    row.addEventListener("click", event => { if (event.target.matches('input,button')) return; openReminderItem(item); });
+    row.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openReminderItem(item); } });
+  }
+  return row;
+}
+
+
+function renderMainOverview() {
+  const area = document.getElementById("mainOverviewArea");
+  area.innerHTML = `
+    <div class="overview-card"><strong>To-do items</strong><span class="overview-number">${data.todos.length}</span></div>
+    <div class="overview-card"><strong>Projects</strong><span class="overview-number">${data.projects.length}</span></div>
+    <div class="overview-card"><strong>Annual dates</strong><span class="overview-number">${data.annualDates.length}</span></div>
+    <div class="overview-card"><strong>Cleaning tasks</strong><span class="overview-number">${data.cleaningTasks.length}</span></div>
+    <div class="overview-card"><strong>Recurring tasks</strong><span class="overview-number">${data.recurringTasks.length}</span></div>
+    <div class="overview-card"><strong>Thoughts</strong><span class="overview-number">${data.inbox.length}</span></div>
+    <div class="overview-card"><strong>Waiting For</strong><span class="overview-number">${data.waiting.length}</span></div>
+  `;
+}
+
+
+
+
+
+function sortByDueDate(a,b) {
+  if (a.completed !== b.completed) return a.completed ? 1 : -1;
+  if (!a.dueDate && !b.dueDate) return 0;
+  if (!a.dueDate) return 1;
+  if (!b.dueDate) return -1;
+  return dateOnly(a.dueDate) - dateOnly(b.dueDate);
+}
+
+function toggleTodo(id) { const item=data.todos.find(x=>x.id===id); if(item)item.completed=!item.completed; saveData(); renderAll(); }
+function deleteTodo(id) { data.todos=data.todos.filter(x=>x.id!==id); saveData(); renderAll(); }
+function toggleProject(id) { const item=data.projects.find(x=>x.id===id); if(item)item.completed=!item.completed; saveData(); renderAll(); }
+function deleteProject(id) { data.projects=data.projects.filter(x=>x.id!==id); saveData(); renderAll(); }
+function deleteAnnual(id) { data.annualDates=data.annualDates.filter(x=>x.id!==id); saveData(); renderAll(); }
+
+
+function deleteStep(projectId,stepId) {
+  const project=data.projects.find(x=>x.id===projectId);
+  if(project) project.steps=project.steps.filter(x=>x.id!==stepId);
+  saveData(); renderAll();
+}
+
+const dialog=document.getElementById("addDialog");
+const addForm=document.getElementById("addForm");
+const itemType=document.getElementById("itemType");
+const timingType=document.getElementById("timingType");
+
+function clearForm() {
+  loadStepBuilder("projectStepsBuilder",[]); loadStepBuilder("itemStepsBuilder",[]);
+  addForm.reset();
+  document.getElementById("editingId").value="";
+  document.getElementById("editingParentId").value="";
+  document.getElementById("monthsCount").value=3;
+  document.getElementById("leadDays").value=7;
+  document.getElementById("annualReminderDays").value=7;
+  document.getElementById("cleaningFrequency").value="weekly";
+  document.getElementById("cleaningStartDate").value=new Date().toISOString().slice(0,10);
+  const itemSteps=document.getElementById("itemSteps"); if(itemSteps)itemSteps.value="";
+  const pending=document.getElementById("itemPending"); if(pending)pending.checked=false;
+  const pendingReason=document.getElementById("itemPendingReason"); if(pendingReason)pendingReason.value="";
+}
+
+function openAddDialog(type="todo",projectId="") {
+  clearForm();
+  const tagsField=document.getElementById("itemTags"); if(tagsField) tagsField.value="";
+  itemType.value=type;
+  document.getElementById("editingParentId").value=projectId;
+  populateProjectPicker(projectId);
+  document.getElementById("dialogTitle").textContent="New item";
+  updateFormVisibility();
+  dialog.showModal();
+  document.getElementById("itemName").focus();
+}
+
+function openAnnualDialog() { openAddDialog("annual"); }
+function closeAddDialog() { dialog.close(); }
+
+function populateProjectPicker(selectedId="") {
+  const picker = document.getElementById("projectPicker");
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  if (!projects.length) {
+    picker.innerHTML = `<option value="">No projects available — add a project first</option>`;
+    picker.disabled = true;
+    return;
+  }
+  picker.disabled = false;
+  picker.innerHTML = projects
+    .map(p=>`<option value="${p.id}">${escapeHtml(p.name)}${p.completed ? " (completed)" : ""}</option>`).join("");
+  if (selectedId && projects.some(p => p.id === selectedId)) picker.value = selectedId;
+}
+
+function updateFormVisibility() {
+  const type=itemType.value;
+  const timing=timingType.value;
+  const routine = type === "daily" || type === "evening";
+  document.getElementById("projectPickerLabel").classList.toggle("hidden",type!=="step");
+  document.getElementById("projectStepsLabel").classList.toggle("hidden",type!=="project");
+  document.getElementById("itemStepsLabel")?.classList.toggle("hidden",!["todo","cleaning","annual"].includes(type));
+  document.getElementById("cleaningAreaLabel").classList.toggle("hidden",type!=="cleaning");
+  document.getElementById("cleaningFrequencyLabel").classList.toggle("hidden",type!=="cleaning");
+  document.getElementById("cleaningStartLabel").classList.toggle("hidden",type!=="cleaning");
+  document.getElementById("annualDateLabel").classList.toggle("hidden",type!=="annual");
+  document.getElementById("annualReminderLabel").classList.toggle("hidden",type!=="annual");
+  document.getElementById("dateLabel").classList.toggle("hidden",timing!=="date" || type==="annual" || routine);
+  document.getElementById("monthsLabel").classList.toggle("hidden",timing!=="months" || type==="annual" || routine);
+  document.getElementById("leadLabel").classList.toggle("hidden",!(["date","months"].includes(timing)) || type==="annual" || routine);
+  timingType.closest("label").classList.toggle("hidden",type==="annual" || type==="cleaning" || routine);
+  document.getElementById("detailsLabel").querySelector("textarea").placeholder =
+    routine ? "For example: 10 minutes, after breakfast, or any helpful note" : "Notes, contact details, what needs doing...";
+  const pendingLabel=document.getElementById("itemPendingLabel");
+  const pendingReasonLabel=document.getElementById("itemPendingReasonLabel");
+  const canPending=(type==="todo"||type==="step");
+  if(pendingLabel)pendingLabel.classList.toggle("hidden",!canPending);
+  if(pendingReasonLabel)pendingReasonLabel.classList.toggle("hidden",!canPending||!document.getElementById("itemPending")?.checked);
+}
+
+itemType.addEventListener("change",()=>{
+  if (itemType.value === "step") populateProjectPicker(document.getElementById("editingParentId").value);
+  updateFormVisibility();
+});
+timingType.addEventListener("change",updateFormVisibility);
+
+function loadCommon(item,type,parentId="") {
+  clearForm();
+  itemType.value=type;
+  document.getElementById("editingId").value=item.id;
+  document.getElementById("editingParentId").value=parentId;
+  document.getElementById("itemName").value=item.name || "";
+  document.getElementById("itemDetails").value=item.details || "";
+  const tagsField=document.getElementById("itemTags"); if(tagsField) tagsField.value=tagsInputValue(item);
+  if (type === "project") loadStepBuilder("projectStepsBuilder", item.steps || []);
+  if (["todo","cleaning","annual"].includes(type)) loadStepBuilder("itemStepsBuilder", item.steps || []);
+  timingType.value=item.timingType || (item.dueDate ? "date" : "none");
+  document.getElementById("dueDate").value=item.dueDate || "";
+  document.getElementById("leadDays").value=item.leadDays ?? 7;
+  const pending=document.getElementById("itemPending"); if(pending)pending.checked=Boolean(item.pending);
+  const pendingReason=document.getElementById("itemPendingReason"); if(pendingReason)pendingReason.value=item.pendingReason||"";
+  populateProjectPicker();
+  if(parentId) document.getElementById("projectPicker").value=parentId;
+  document.getElementById("dialogTitle").textContent="Edit item";
+  updateFormVisibility();
+  dialog.showModal();
+}
+
+function editTodo(id) { const item=data.todos.find(x=>x.id===id); if(item)loadCommon(item,"todo"); }
+function editProject(id) { const item=data.projects.find(x=>x.id===id); if(item)loadCommon(item,"project"); }
+function editStep(projectId,stepId) {
+  const project=data.projects.find(x=>x.id===projectId);
+  const item=project?.steps.find(x=>x.id===stepId);
+  if(item)loadCommon(item,"step",projectId);
+}
+function editAnnual(id) {
+  const item=data.annualDates.find(x=>x.id===id);
+  if(!item)return;
+  clearForm();
+  itemType.value="annual";
+  document.getElementById("editingId").value=item.id;
+  document.getElementById("itemName").value=item.name || "";
+  document.getElementById("itemDetails").value=item.details || "";
+  const tagsField=document.getElementById("itemTags"); if(tagsField) tagsField.value=tagsInputValue(item);
+  const nextBirthday = nextAnnualOccurrence(item.monthDay);
+  document.getElementById("annualDate").value=nextBirthday ? localDateKey(nextBirthday) : "";
+  const birthYearField=document.getElementById("annualBirthYear");
+  if(birthYearField) birthYearField.value=item.birthYear || "";
+  document.getElementById("annualReminderDays").value=item.reminderDays ?? 7;
+  document.getElementById("dialogTitle").textContent="Edit annual date";
+  updateFormVisibility();
+  dialog.showModal();
+}
+
+addForm.addEventListener("submit",event=>{
+  event.preventDefault();
+  const type=itemType.value;
+  const id=document.getElementById("editingId").value;
+  const parentId=document.getElementById("editingParentId").value || document.getElementById("projectPicker").value;
+  const name=document.getElementById("itemName").value.trim();
+  const details=document.getElementById("itemDetails").value.trim();
+  const timing=timingType.value;
+  const leadDays=Number(document.getElementById("leadDays").value || 7);
+  syncStepBuilders();
+  if(!name)return;
+
+  if(type==="daily" || type==="evening") {
+    const list = type === "evening" ? data.eveningTasks : data.dailyTasks;
+    const payload = { id: id || uid(), title: name, time: details };
+    if (id) list[list.findIndex(x => x.id === id)] = payload;
+    else list.push(payload);
+    saveData(); closeAddDialog(); renderAll(); refreshListsImmediately(); return;
+  }
+
+  if(type==="cleaning") {
+    const startDate = document.getElementById("cleaningStartDate").value || new Date().toISOString().slice(0,10);
+    const payload = {
+      id: id || uid(),
+      name,
+      details,
+      tags:normaliseTags(document.getElementById("itemTags")?.value),
+      room: document.getElementById("cleaningRoom").value.trim(),
+      frequency: document.getElementById("cleaningFrequency").value,
+      nextDue: startDate,
+      lastCompleted: null,
+      steps: mergeEnteredSteps(id?(data.cleaningTasks.find(x=>x.id===id)?.steps||[]):[], parseDatedSteps(document.getElementById("itemSteps")?.value||""), {})
+    };
+    if(id) {
+      const old = data.cleaningTasks.find(x => x.id === id);
+      payload.lastCompleted = old?.lastCompleted || null;
+      data.cleaningTasks[data.cleaningTasks.findIndex(x => x.id === id)] = payload;
+    } else {
+      data.cleaningTasks.push(payload);
+    }
+    saveData(); closeAddDialog(); renderAll(); refreshListsImmediately(); return;
+  }
+
+  if(type==="annual") {
+    const annualDate=document.getElementById("annualDate").value;
+    if(!annualDate)return;
+    const monthDay=annualDate.slice(5);
+    const nextOccurrence=nextAnnualOccurrence(monthDay);
+    if(!nextOccurrence){ alert("Please enter a valid birthday or annual date."); return; }
+    const oldAnnual=id?data.annualDates.find(x=>x.id===id):null;
+    const birthYearRaw=String(document.getElementById("annualBirthYear")?.value||"").trim();
+    const birthYear=birthYearRaw ? Number(birthYearRaw) : null;
+    const payload={id:id||uid(),name,details,tags:normaliseTags(document.getElementById("itemTags")?.value),monthDay,birthYear:Number.isFinite(birthYear)&&birthYear>=1900&&birthYear<=new Date().getFullYear()?birthYear:null,reminderDays:Number(document.getElementById("annualReminderDays").value||7),kind:"Birthday / annual date",steps:mergeEnteredSteps(oldAnnual?.steps||[],parseDatedSteps(document.getElementById("itemSteps")?.value||""),{})};
+    if(id) data.annualDates[data.annualDates.findIndex(x=>x.id===id)]=payload;
+    else data.annualDates.push(payload);
+    saveData(); closeAddDialog(); renderAll(); refreshListsImmediately(); return;
+  }
+
+  let dueDate=null;
+  if(timing==="date") dueDate=document.getElementById("dueDate").value || null;
+  if(timing==="months") {
+    const date=new Date();
+    date.setMonth(date.getMonth()+Number(document.getElementById("monthsCount").value||1));
+    dueDate=date.toISOString().slice(0,10);
+  }
+
+  const common={id:id||uid(),name,details,tags:normaliseTags(document.getElementById("itemTags")?.value),timingType:timing,dueDate,leadDays,completed:false};
+  const parsedItemSteps = parseDatedSteps(document.getElementById("itemSteps")?.value || "");
+
+  if(type==="todo") {
+    if(id) {
+      const old=data.todos.find(x=>x.id===id);
+      common.completed=old?.completed||false;
+      common.pending=Boolean(document.getElementById('itemPending')?.checked);
+      common.pendingReason=common.pending?String(document.getElementById('itemPendingReason')?.value||'').trim():'';
+      common.steps=mergeEnteredSteps(old?.steps || [], parsedItemSteps, common);
+      common.attachment=old?.attachment||null;data.todos[data.todos.findIndex(x=>x.id===id)]=common;
+    } else {
+      common.pending=Boolean(document.getElementById('itemPending')?.checked);
+      common.pendingReason=common.pending?String(document.getElementById('itemPendingReason')?.value||'').trim():'';
+      common.steps=mergeEnteredSteps([], parsedItemSteps, common); data.todos.push(common);
+    }
+  }
+
+  if(type==="project") {
+    const enteredSteps = parseDatedSteps(document.getElementById("projectSteps").value);
+    if(id) {
+      const old=data.projects.find(x=>x.id===id);
+      const oldSteps = old?.steps || [];
+      const steps = enteredSteps.map((entry,index) => {
+        const existing = oldSteps[index];
+        return existing ? {...existing,name:entry.name,dueDate:entry.dueDate || existing.dueDate || null,order:index} : {id:uid(),name:entry.name,details:"",timingType:entry.dueDate?"date":common.timingType,dueDate:entry.dueDate || common.dueDate,leadDays:entry.leadDays || common.leadDays,completed:false,order:index};
+      });
+      data.projects[data.projects.findIndex(x=>x.id===id)]={...common,completed:old?.completed||false,steps,attachment:old?.attachment||null};
+    } else {
+      const steps = enteredSteps.map((entry,index) => ({id:uid(),name:entry.name,details:"",timingType:entry.dueDate?"date":common.timingType,dueDate:entry.dueDate || common.dueDate,leadDays:entry.leadDays || common.leadDays,completed:false,order:index}));
+      data.projects.push({...common,steps});
+    }
+  }
+
+  if(type==="step") {
+    const project=data.projects.find(x=>x.id===parentId);
+    if(project) {
+      if(id) {
+        const old=project.steps.find(x=>x.id===id);
+        const pending=Boolean(document.getElementById('itemPending')?.checked);
+        project.steps[project.steps.findIndex(x=>x.id===id)]={...common,completed:old?.completed||false,pending,pendingReason:pending?String(document.getElementById('itemPendingReason')?.value||'').trim():'',order:old?.order};
+      } else {
+        const pending=Boolean(document.getElementById('itemPending')?.checked);
+        project.steps.push({...common,pending,pendingReason:pending?String(document.getElementById('itemPendingReason')?.value||'').trim():'',order:project.steps.length}); project.completed=false;
+      }
+    }
+  }
+
+  if(type==="category") {
+    const category=document.getElementById("categoryPicker").value;
+    data.categoryTasks[category].push(name);
+  }
+
+  saveData(); closeAddDialog(); renderAll(); refreshListsImmediately();
+});
+
+function parseDatedSteps(text) {
+  return String(text||"").split(/\n/).map(x=>x.trim()).filter(Boolean).map(line=>{
+    const parts=line.split("|");
+    let raw=parts.length>1?parts.shift().trim():"";
+    let name=(parts.length?parts.join("|"):line).trim();
+    let leadDays=0;
+    const leadMatch=name.match(/\|\s*lead:(\d+)\s*$/);
+    if(leadMatch){leadDays=Number(leadMatch[1]);name=name.replace(/\|\s*lead:\d+\s*$/,"").trim();}
+    let dueDate=null;
+    let m=raw.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2}|\d{4})$/);
+    if(m){let y=m[3]; if(y.length===2)y="20"+y; dueDate=`${y}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;}
+    else if(/^\d{4}-\d{2}-\d{2}$/.test(raw)) dueDate=raw;
+    else if(parts.length===0) name=line;
+    return {name,dueDate,leadDays};
+  });
+}
+function mergeEnteredSteps(oldSteps, entered, defaults={}) {
+  return entered.map((entry,index)=>{const old=oldSteps[index]; return old?{...old,name:entry.name,dueDate:entry.dueDate||old.dueDate||null,order:index}:{id:uid(),name:entry.name,dueDate:entry.dueDate||null,details:"",completed:false,order:index,leadDays:entry.leadDays||defaults.leadDays||0,timingType:entry.dueDate?"date":"none"};});
+}
+
+function escapeHtml(value) {
+  return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+}
+
+function getSettingsFromAnyKey() {
+  const keys = [SETTINGS_KEY, ...LEGACY_SETTINGS_KEYS];
+  const candidates = [];
+
+  for (const key of keys) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") candidates.push(parsed);
+    } catch {}
+  }
+
+  if (!candidates.length) return {};
+
+  // Some older releases created a new default settings record while the user's
+  // actual colour/font remained in a legacy record. Prefer a genuinely
+  // customised value instead of allowing that default record to mask it.
+  const customised = candidates.find(item =>
+    (item.theme && item.theme !== "sage") ||
+    (item.font && item.font !== "clear") ||
+    (item.ownerName && String(item.ownerName).trim())
+  );
+
+  return customised || candidates[0];
+}
+function getSettings() {
+  const settings = { ownerName:"", theme:"sage", font:"clear", ...getSettingsFromAnyKey() };
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+  return settings;
+}
+
+function openSettingsDialog() {
+  setTimeout(refreshBrainShortcutUrl,0);
+  document.getElementById("settingsDialog")?.showModal();
+  applySettings();
+  previewSettings();
+  renderDailyBackups();
+  updateStorageStatus();
+  refreshDeveloperDashboard();
+}
+function formatStorageBytes(bytes) {
+  const value=Number(bytes)||0;
+  if(value<1024)return `${value} B`;
+  if(value<1024*1024)return `${(value/1024).toFixed(1)} KB`;
+  if(value<1024*1024*1024)return `${(value/(1024*1024)).toFixed(1)} MB`;
+  return `${(value/(1024*1024*1024)).toFixed(1)} GB`;
+}
+
+async function refreshDeveloperDashboard() {
+  const setText=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=String(value ?? "—");};
+  setText("devPlannerVersion", `v${APP_VERSION}`);
+  setText("devCacheVersion", `my-life-planner-v${APP_VERSION}`);
+  setText("devManifestVersion", APP_VERSION);
+  setText("devDatabaseVersion", DATABASE_VERSION);
+  setText("devBrainModule", MODULE_VERSIONS.brainCapture);
+  setText("devAttachmentModule", MODULE_VERSIONS.attachments);
+  setText("devAppointmentModule", MODULE_VERSIONS.appointments);
+  setText("devQuickModule", MODULE_VERSIONS.quickActions);
+  setText("devAppointmentsCount", data.appointments.length);
+  setText("devTodosCount", data.todos.length);
+  setText("devInboxCount", data.inbox.length);
+  const backups=getDailyBackups();
+  const newest=backups.slice().sort((a,b)=>String(b.savedAt||"").localeCompare(String(a.savedAt||"")))[0];
+  setText("devLastBackup", newest?.savedAt ? new Date(newest.savedAt).toLocaleString("en-GB", {dateStyle:"medium", timeStyle:"short"}) : "No backup yet");
+  try {
+    const estimate=await navigator.storage?.estimate?.();
+    const used=Number(estimate?.usage)||0;
+    const quota=Number(estimate?.quota)||0;
+    setText("devStorageUsed", formatStorageBytes(used));
+    setText("devStorageQuota", quota ? formatStorageBytes(quota) : "Not reported");
+  } catch {
+    setText("devStorageUsed", "Not reported");
+    setText("devStorageQuota", "Not reported");
+  }
+}
+
+function closeSettingsDialog() { document.getElementById("settingsDialog")?.close(); }
+function previewSettings() {
+  const theme=document.getElementById("themeChoice")?.value || "sage";
+  const font=document.getElementById("fontChoice")?.value || "clear";
+  const themePreview=document.getElementById("themePreview");
+  const fontPreview=document.getElementById("fontPreview");
+  if(themePreview) themePreview.dataset.themePreview=theme;
+  if(fontPreview) fontPreview.dataset.fontPreview=font;
+  // Preview the selected font across the whole app immediately.
+  document.body.dataset.font = font;
+}
+
+function applySettings() {
+  const settings = getSettings();
+  document.body.dataset.theme = settings.theme;
+  document.body.dataset.font = settings.font;
+  const title = document.getElementById("plannerTitle");
+  if (title) title.textContent = settings.ownerName ? `${settings.ownerName}'s Life Planner` : "My Life Planner";
+  const owner = document.getElementById("ownerName");
+  const theme = document.getElementById("themeChoice");
+  const font = document.getElementById("fontChoice");
+  if (owner) owner.value = settings.ownerName;
+  if (theme) theme.value = settings.theme;
+  if (font) font.value = settings.font;
+  previewSettings();
+}
+
+function saveSettings() {
+  const settings = {
+    ownerName: document.getElementById("ownerName")?.value.trim() || "",
+    theme: document.getElementById("themeChoice")?.value || "sage",
+    font: document.getElementById("fontChoice")?.value || "clear"
+  };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  applySettings();
+  saveData();
+  showSaved("Customisation saved");
+  closeSettingsDialog();
+}
+
+function renderAll() {
+  setDate();
+  renderChecklist("dailyChecklist",data.dailyTasks,"daily",false);
+  renderChecklist("eveningChecklist",data.eveningTasks,"daily",false);
+  prepareTodayFocusForToday();
+  renderTodayFocus();
+  renderFocusToday();
+  renderInbox();
+  renderWaiting();
+  renderAppointments();
+  try { renderTimeline(); } catch (error) {
+    console.error("Timeline could not be rendered", error);
+    const area=document.getElementById("timelineArea");
+    const summary=document.getElementById("timelineSummary");
+    if(area) area.innerHTML='<div class="empty-state">Timeline could not be loaded. Your saved lists are unaffected.</div>';
+    if(summary) summary.textContent='Timeline unavailable.';
+  }
+  updateListHubCounts();
+  renderProjectNextActions();
+  renderTodayReminders();
+  renderWeekly();
+  renderCleaningToday();
+  renderTodos();
+  renderAnnualDates();
+  renderProjects();
+  renderCleaning();
+  renderCustomLists();
+  renderMainOverview();
+  updateProgress();
+  updateStorageStatus();
+  renderDailyBackups();
+  applySettings();
+  restorePanelStates();
+  initialiseHomeCollapsibles();
+}
+
+
+let waitingServiceWorker = null;
+let plannerServiceWorkerRegistration = null;
+let plannerReloadingForUpdate = false;
+const PLANNER_VERSION_URL = './version.json';
+
+function plannerWorkerUrl(version=APP_VERSION) {
+  return `./service-worker.js?v=${encodeURIComponent(version)}`;
+}
+
+async function fetchPublishedPlannerVersion() {
+  const response = await fetch(`${PLANNER_VERSION_URL}?t=${Date.now()}`, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+  });
+  if (!response.ok) throw new Error(`Version check failed (${response.status})`);
+  const payload = await response.json();
+  return String(payload.version || '').trim();
+}
+
+function setUpdateButtonState(label, disabled=false) {
+  const button=document.getElementById('updateButton');
+  if (!button) return;
+  button.textContent=label;
+  button.disabled=disabled;
+  button.classList.remove('hidden');
+}
+
+function waitForWorkerState(worker, timeoutMs=15000) {
+  return new Promise(resolve => {
+    if (!worker) return resolve(null);
+    if (worker.state === 'installed' || worker.state === 'activated') return resolve(worker);
+    let settled=false;
+    let timer=null;
+    const finish=()=>{
+      if(settled)return;
+      settled=true;
+      if(timer)clearTimeout(timer);
+      worker.removeEventListener('statechange',onState);
+      resolve(worker);
+    };
+    const onState=()=>{
+      if(worker.state==='installed'||worker.state==='activated'||worker.state==='redundant')finish();
+    };
+    worker.addEventListener('statechange',onState);
+    timer=setTimeout(finish,timeoutMs);
+  });
+}
+
+async function registerPlannerWorker(version=APP_VERSION) {
+  if (!("serviceWorker" in navigator)) return null;
+  const requestedUrl=plannerWorkerUrl(version);
+  const registration=await navigator.serviceWorker.register(requestedUrl,{
+    scope:'./',
+    updateViaCache:'none'
+  });
+  plannerServiceWorkerRegistration=registration;
+  return registration;
+}
+
+async function ensurePlannerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return null;
+  if (plannerServiceWorkerRegistration) return plannerServiceWorkerRegistration;
+  return registerPlannerWorker(APP_VERSION);
+}
+
+function plannerReloadFresh(version='') {
+  if (plannerReloadingForUpdate) return;
+  plannerReloadingForUpdate=true;
+  const url=new URL('./index.html',window.location.href);
+  url.searchParams.set('updated',version||APP_VERSION);
+  url.searchParams.set('_',Date.now().toString());
+  window.location.replace(url.toString());
+
+  // If navigation is interrupted by an older controller/browser cache, permit
+  // another reload attempt rather than leaving the tab permanently locked.
+  setTimeout(()=>{plannerReloadingForUpdate=false;},5000);
+}
+
+async function activatePublishedPlanner(version) {
+  sessionStorage.setItem('myLifePlannerPendingVersion',version||'new');
+
+  // Register the worker using the PUBLISHED VERSION in the script URL. This
+  // forces an old desktop tab to request the actual new worker instead of
+  // depending on the browser's previous service-worker script URL/cache state.
+  const registration=await registerPlannerWorker(version);
+  try{await registration.update();}catch(_){}
+
+  const candidate=registration.waiting||registration.installing;
+  if(candidate){
+    await waitForWorkerState(candidate);
+    const worker=registration.waiting||candidate;
+    waitingServiceWorker=worker;
+    try{worker.postMessage({type:'SKIP_WAITING'});}catch(_){}
+  }
+
+  // Do not rely solely on controllerchange: Chromium/Safari timing differs.
+  // A cache-busted navigation is a deterministic fallback and the SW serves
+  // navigations network-first/no-store.
+  setTimeout(()=>plannerReloadFresh(version),600);
+  return registration;
+}
+
+async function checkForAppUpdates({silent=false}={}) {
+  if (!("serviceWorker" in navigator)) {
+    if(!silent) alert('App updates are not supported by this browser.');
+    return false;
+  }
+  try {
+    if(!silent)setUpdateButtonState('Checking…',true);
+    const publishedVersion=await fetchPublishedPlannerVersion();
+    if(!publishedVersion)throw new Error('Published version is missing.');
+
+    if(publishedVersion===APP_VERSION){
+      await ensurePlannerServiceWorker();
+      setUpdateButtonState('Check for updates',false);
+      if(!silent)alert(`You already have the latest version (v${APP_VERSION}).`);
+      return false;
+    }
+
+    setUpdateButtonState(`Updating to v${publishedVersion}…`,true);
+
+    if(!silent){
+      const proceed=confirm(`My Life Planner v${publishedVersion} is available. Apply it now?`);
+      if(!proceed){
+        setUpdateButtonState(`Update to v${publishedVersion}`,false);
+        return true;
+      }
+    }
+
+    // Silent checks now APPLY the published update automatically. Previously
+    // desktop could discover a new version but stay on the old build.
+    await activatePublishedPlanner(publishedVersion);
+    return true;
+  } catch(error) {
+    console.error('Update check failed',error);
+    setUpdateButtonState('Check for updates',false);
+    if(!silent)alert('The update check could not be completed. Please check your connection and try again.');
+    return false;
+  }
+}
+
+function applyAppUpdate(targetVersion='') {
+  const version=targetVersion||sessionStorage.getItem('myLifePlannerPendingVersion')||'';
+  if(version){
+    activatePublishedPlanner(version).catch(error=>{
+      console.error('Apply update failed',error);
+      plannerReloadFresh(version);
+    });
+    return;
+  }
+  plannerReloadFresh();
+}
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener('load',async()=>{
+    try{
+      const registration=await ensurePlannerServiceWorker();
+      if(registration?.waiting){
+        waitingServiceWorker=registration.waiting;
+        setUpdateButtonState('Update available');
+      }
+
+      registration?.addEventListener('updatefound',()=>{
+        const worker=registration.installing;
+        worker?.addEventListener('statechange',()=>{
+          if(worker.state==='installed'&&navigator.serviceWorker.controller){
+            waitingServiceWorker=registration.waiting||worker;
+            setUpdateButtonState('Update available');
+          }
+        });
+      });
+
+      // One network-only comparison on every load. If the deployment is newer,
+      // apply it rather than merely advertising it.
+      /* Tester channel: updates are deliberate releases; no silent Development updates. */
+    }catch(error){
+      console.warn('Offline app registration failed',error);
+    }
+  });
+
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+    const target=sessionStorage.getItem('myLifePlannerPendingVersion')||'';
+    sessionStorage.removeItem('myLifePlannerPendingVersion');
+    plannerReloadFresh(target);
+  });
+
+  navigator.serviceWorker.addEventListener('message',event=>{
+    if(event.data?.type==='PLANNER_WORKER_ACTIVE'){
+      const activeVersion=String(event.data.version||'');
+      if(activeVersion&&activeVersion!==APP_VERSION)plannerReloadFresh(activeVersion);
+    }
+  });
+}
+
+applySettings();
+createRecoveryCopy(JSON.stringify(data));
+renderAll();
+
+
+function getCollapsedListSections() {
+  try { return JSON.parse(localStorage.getItem('myLifePlannerCollapsedLists') || '{}'); }
+  catch (error) { return {}; }
+}
+
+function saveCollapsedListSections(state) {
+  localStorage.setItem('myLifePlannerCollapsedLists', JSON.stringify(state));
+}
+
+function applyListSectionState(section, collapsed) {
+  if (!section) return;
+  section.classList.toggle('list-section-collapsed', collapsed);
+  const toggle = section.querySelector('.list-collapse-toggle');
+  const name = section.dataset.listName || 'list';
+  if (toggle) {
+    toggle.textContent = collapsed ? `Show ${name}` : `Hide ${name}`;
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+  }
+}
+
+function toggleListSection(sectionId) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  const state = getCollapsedListSections();
+  const collapsed = !section.classList.contains('list-section-collapsed');
+  state[sectionId] = collapsed;
+  saveCollapsedListSections(state);
+  applyListSectionState(section, collapsed);
+}
+
+function addListSectionControls() {
+  const state = getCollapsedListSections();
+  document.querySelectorAll('.managed-list-section').forEach(section => {
+    const heading = section.querySelector(':scope > .section-heading');
+    if (!heading) return;
+    let controls = heading.querySelector('.list-heading-controls');
+    if (!controls) {
+      controls = document.createElement('div');
+      controls.className = 'list-heading-controls';
+      const existingAdd = heading.querySelector('.section-plus');
+      if (existingAdd) controls.appendChild(existingAdd);
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'small-button secondary-button list-collapse-toggle';
+      toggle.onclick = () => toggleListSection(section.id);
+      controls.appendChild(toggle);
+      heading.appendChild(controls);
+    }
+    applyListSectionState(section, Boolean(state[section.id]));
+  });
+}
+
+function prepareListsView() {
+  const search = document.getElementById('globalListSearch');
+  if (search && search.value) search.value = '';
+  document.querySelectorAll('.managed-list-section').forEach(section => {
+    section.hidden = false;
+    section.classList.remove('search-no-match');
+    section.querySelectorAll('.compact-manage-row,.annual-manage-row,.list-card,.v10-row').forEach(row => {
+      row.hidden = false;
+    });
+  });
+  addListSectionControls();
+}
+
+function showAppView(view, button) {
+  if(view !== 'tasks') toggleListsSideNav(false);
+  const titles = {
+    home: ["Home", "Your day"],
+    tasks: ["Lists", "All tasks saved under each category"],
+    planner: ["Planner", "Projects, dates and routines"]
+  };
+  document.querySelectorAll('.app-view-section').forEach(section => {
+    section.hidden = section.dataset.view !== view;
+  });
+  if (view === 'tasks') {
+    renderTodos();
+    renderAppointments();
+    renderRecurringTasks();
+    renderInbox();
+    renderWaiting();
+    renderAnnualDates();
+    renderProjects();
+    renderCleaning();
+    updateListHubCounts();
+    prepareListsView();
+  }
+  document.querySelectorAll('.bottom-nav .nav-button[data-tab]').forEach(btn => btn.classList.remove('active'));
+  const activeButton = button || document.querySelector(`.bottom-nav .nav-button[data-tab="${view}"]`);
+  if (activeButton) activeButton.classList.add('active');
+  const copy = titles[view] || titles.home;
+  const eyebrow = document.getElementById('viewEyebrow');
+  const title = document.getElementById('viewTitle');
+  if (eyebrow) eyebrow.textContent = copy[0];
+  if (title) title.textContent = copy[1];
+  localStorage.setItem('myLifePlannerActiveView', view);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+let plannerWasHidden = false;
+
+function returnPlannerToHome() {
+  localStorage.removeItem('myLifePlannerActiveView');
+  showAppView('home');
+}
+
+// A newly loaded app always starts on Home.
+document.addEventListener('DOMContentLoaded', () => { if(!openRequestedLaunch()) returnPlannerToHome(); });
+
+// Installed PWAs commonly remain alive in the background instead of reloading.
+// Treat leaving and returning to the app as a fresh opening and return to Home.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    plannerWasHidden = true;
+  } else if (plannerWasHidden) {
+    plannerWasHidden = false;
+    if(!openRequestedLaunch()) returnPlannerToHome();
+  }
+});
+
+window.addEventListener('pageshow', event => {
+  if (event.persisted) returnPlannerToHome();
+});
+
+/* v9.7 dashboard and compact-management refinements */
+function activeProjectDashboardItems() {
+  const today = new Date().toISOString().slice(0,10);
+  return data.projects.flatMap(project => {
+    if (project.completed) return [];
+    const nextStep = (project.steps || []).find(step => !step.completed && !step.pending);
+    if (!nextStep) return [];
+    return [{...nextStep, dueDate: nextStep.dueDate || today, source:`Project: ${project.name}`, itemType:"step", parentId:project.id, isUndatedProjectStep:!nextStep.dueDate}];
+  });
+}
+function activeTodoDashboardItems() {
+  return data.todos.flatMap(todo=>{
+    if(todo.completed) return [];
+    const steps=todo.steps||[];
+    const next=steps.find(s=>!s.completed);
+    if(next) return [{...next,source:`To-do: ${todo.name}`,itemType:"todoStep",parentId:todo.id}];
+    return [{...todo,source:"To-do",itemType:"todo"}];
+  });
+}
+function getTodayReminderItems() {
+  const today=new Date(); today.setHours(12,0,0,0);
+  const dated=[...activeTodoDashboardItems(),...activeProjectDashboardItems(),...appointmentDashboardItems()].filter(x=>!x.completed&&x.dueDate&&dateOnly(x.dueDate)<=today);
+  const annual=data.annualDates.map(item=>({item,status:annualStatus(item)})).filter(e=>e.status&&(e.status.isToday||e.status.inReminderWindow)).map(e=>({id:e.item.id,name:e.item.name,details:e.item.details,source:e.status.isToday?"Annual date today":"Annual reminder",dueDate:e.status.occurrence.toISOString().slice(0,10),itemType:"annual"}));
+  const cleaning=data.cleaningTasks.filter(i=>isDueTodayOrEarlier(i.nextDue)).map(i=>({id:i.id,name:i.name,details:i.details,source:`Cleaning: ${i.room||"General"}`,dueDate:i.nextDue,itemType:"cleaning"}));
+  return [...dated,...annual,...cleaning].sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+}
+function getWeeklyItems() {
+  const today=new Date(); today.setHours(12,0,0,0);
+  const end=new Date(today); end.setDate(end.getDate()+7);
+  const ordinary=[...activeTodoDashboardItems(),...activeProjectDashboardItems(),...appointmentDashboardItems(),...data.cleaningTasks.map(i=>({id:i.id,name:i.name,details:i.details,source:`Cleaning: ${i.room||"General"}`,dueDate:i.nextDue,itemType:"cleaning",completed:false,leadDays:0}))]
+    .filter(i=>!i.completed&&i.dueDate)
+    .filter(i=>{
+      const due=dateOnly(i.dueDate);
+      const lead=Number(i.leadDays||0);
+      const reminderStart=new Date(due); reminderStart.setDate(reminderStart.getDate()-lead);
+      // Today and overdue items belong only in the Today panel.
+      return due>today && reminderStart<=end;
+    });
+  const annual=data.annualDates
+    .map(i=>{const o=nextAnnualOccurrence(i.monthDay);return {...i,source:i.kind||"Annual reminder",dueDate:o?o.toISOString().slice(0,10):null,annual:true,itemType:"annual"};})
+    .filter(i=>i.dueDate&&dateOnly(i.dueDate)>today&&dateOnly(i.dueDate)<=end);
+  return [...ordinary,...annual].sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+}
+function toggleTodoStep(todoId,stepId){const todo=data.todos.find(x=>x.id===todoId),step=todo?.steps?.find(x=>x.id===stepId);if(!todo||!step)return;step.completed=!step.completed;todo.completed=(todo.steps||[]).length>0&&todo.steps.every(s=>s.completed);saveData();renderAll();}
+function openReminderItem(item){if(item.itemType==="todo")editTodo(item.id);else if(item.itemType==="todoStep")editTodo(item.parentId);else if(item.itemType==="step")editStep(item.parentId,item.id);else if(item.itemType==="cleaning")editCleaning(item.id);else if(item.itemType==="annual"||item.annual)editAnnual(item.id);else if(item.itemType==="appointment")openAppointmentDialog(item.id);else if(item.itemType==="project")editProject(item.id);}
+function completionFor(item){if(item.itemType==="cleaning")return()=>completeCleaning(item.id);if(item.itemType==="todo")return()=>toggleTodo(item.id);if(item.itemType==="todoStep")return()=>toggleTodoStep(item.parentId,item.id);if(item.itemType==="step")return()=>toggleStep(item.parentId,item.id);return null;}
+function renderTodayReminders(){const area=document.getElementById("todayRemindersArea"),items=getTodayReminderItems();area.innerHTML="";if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}items.forEach(item=>{const overdue=item.itemType!=="annual"&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));area.appendChild(compactReminderRow(item,{meta:`${item.source} · ${formatDate(item.dueDate,item.itemType!=="annual")}${overdue?" · OVERDUE":""}`,actionable:item.itemType!=="annual",onComplete:completionFor(item),clickable:true}));});}
+function renderWeekly(){
+  const area=document.getElementById('weeklyArea'),items=getWeeklyItems();if(!area)return;area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing needs attention this week.</div>';return;}
+  let current='';
+  items.forEach(item=>{
+    const key=String(item.dueDate||'').slice(0,10);
+    if(key!==current){current=key;const h=document.createElement('h3');h.className='timeline-date-heading home-week-date-heading';h.textContent=formatDate(key);area.appendChild(h);}
+    area.appendChild(compactReminderRow(item,{meta:`${item.source}`,actionable:item.itemType!=='annual',onComplete:completionFor(item),clickable:true}));
+  });
+}
+let activeAnchoredMenu=null;
+function closeAnchoredMenu(){if(activeAnchoredMenu){activeAnchoredMenu.remove();activeAnchoredMenu=null;}}
+function showAnchoredMenu(button){
+  closeAnchoredMenu();
+  const template=button.parentElement.querySelector('.item-menu-template');
+  if(!template)return;
+  const pop=document.createElement('div'); pop.className='anchored-item-menu';
+  pop.innerHTML=`<button type="button" class="menu-close-x" aria-label="Close">×</button>${template.innerHTML}`;
+  document.body.appendChild(pop); activeAnchoredMenu=pop;
+  const r=button.getBoundingClientRect(), gap=6;
+  const w=pop.offsetWidth, h=pop.offsetHeight;
+  let left=Math.min(window.innerWidth-w-8,Math.max(8,r.right-w));
+  let top=r.bottom+gap;
+  if(top+h>window.innerHeight-8) top=Math.max(8,r.top-h-gap);
+  pop.style.left=`${left}px`; pop.style.top=`${top}px`;
+  pop.querySelector('.menu-close-x').onclick=closeAnchoredMenu;
+}
+document.addEventListener('click',e=>{if(activeAnchoredMenu&&!activeAnchoredMenu.contains(e.target)&&!e.target.closest('.item-menu-trigger'))closeAnchoredMenu();});
+window.addEventListener('scroll',closeAnchoredMenu,true); window.addEventListener('resize',closeAnchoredMenu);
+function compactMenu(actions,label){return `<span class="item-menu-anchor"><button type="button" class="item-menu-trigger" onclick="event.stopPropagation();showAnchoredMenu(this)" aria-label="Options for ${escapeHtml(label)}">⋯</button><span class="item-menu-template hidden">${actions}</span></span>`;}
+function renderAnnualDates(){const area=document.getElementById('annualArea');area.innerHTML='';if(!data.annualDates.length){area.innerHTML='<div class="empty-state">No birthdays or annual dates yet.</div>';return;}[...data.annualDates].sort((a,b)=>nextAnnualOccurrence(a.monthDay)-nextAnnualOccurrence(b.monthDay)).forEach(item=>{const next=nextAnnualOccurrence(item.monthDay),row=document.createElement('div');row.className='annual-manage-row';const nextText=next?next.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'long',year:'numeric'}):'';const reminder=Number(item.reminderDays??7);const age=(item.birthYear&&next)?` · turns ${next.getFullYear()-Number(item.birthYear)}`:'';row.innerHTML=`<div><strong>${escapeHtml(item.name)}</strong><div class="card-meta">${nextText?`Next: ${escapeHtml(nextText)}`:''}${age} · reminder ${reminder} day${reminder===1?'':'s'} before</div></div>${compactMenu(`<button onclick="closeAnchoredMenu();editAnnual('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();deleteAnnual('${item.id}')">Delete</button>`,item.name)}`;area.appendChild(row);});}
+
+function addStepBuilderRow(builderId, step={}){
+ const box=document.getElementById(builderId); if(!box)return;
+ const row=document.createElement('div'); row.className='step-builder-row';
+ const mode=step.leadDays>0?'before':(step.dueDate?'date':'none');
+ row.innerHTML=`<input class="step-name-input" type="text" placeholder="Step description" value="${escapeHtml(step.name||'')}"><select class="step-date-mode"><option value="none">No date</option><option value="date" ${mode==='date'?'selected':''}>Choose date</option><option value="before" ${mode==='before'?'selected':''}>Days before event</option></select><input class="step-date-input ${mode==='date'?'':'hidden'}" type="date" value="${step.dueDate||''}"><div class="step-before-input ${mode==='before'?'':'hidden'}"><input type="number" min="0" max="3650" value="${step.leadDays||1}"><span>days before</span></div><button type="button" class="step-remove" aria-label="Remove step">×</button>`;
+ row.querySelector('.step-date-mode').addEventListener('change',e=>{row.querySelector('.step-date-input').classList.toggle('hidden',e.target.value!=='date');row.querySelector('.step-before-input').classList.toggle('hidden',e.target.value!=='before');});
+ row.querySelector('.step-remove').onclick=()=>row.remove(); box.appendChild(row);
+}
+function loadStepBuilder(builderId,steps=[]){const box=document.getElementById(builderId);if(!box)return;box.innerHTML='';(steps||[]).forEach(s=>addStepBuilderRow(builderId,s));}
+function baseDateForSteps(builderId){if(builderId==='projectStepsBuilder'||builderId==='itemStepsBuilder'){const t=document.getElementById('itemType').value;if(t==='annual'){const v=document.getElementById('annualDate').value;if(!v)return null;const next=nextAnnualOccurrence(v.slice(5));return next?localDateKey(next):null;}return document.getElementById('dueDate').value||null;}return null;}
+function serializeStepBuilder(builderId){const box=document.getElementById(builderId),base=baseDateForSteps(builderId);if(!box)return '';return [...box.querySelectorAll('.step-builder-row')].map(row=>{const name=row.querySelector('.step-name-input').value.trim();if(!name)return null;const mode=row.querySelector('.step-date-mode').value;let date='';let leadDays=0;if(mode==='date')date=row.querySelector('.step-date-input').value||'';if(mode==='before'){leadDays=Number(row.querySelector('.step-before-input input').value||0);if(base){const d=new Date(base+'T12:00:00');d.setDate(d.getDate()-leadDays);date=d.toISOString().slice(0,10);}}return `${date} | ${name} | lead:${leadDays}`;}).filter(Boolean).join('\n');}
+function syncStepBuilders(){const a=document.getElementById('projectSteps');const b=document.getElementById('itemSteps');if(a)a.value=serializeStepBuilder('projectStepsBuilder');if(b)b.value=serializeStepBuilder('itemStepsBuilder');}
+
+
+/* ===== Version 10 experience ===== */
+function dueClass(value){
+  if(!value) return 'status-future';
+  const d=dateOnly(value),today=new Date();today.setHours(12,0,0,0);
+  const days=daysBetween(today,d);
+  return days<0?'status-overdue':days<=2?'status-soon':'status-future';
+}
+function prepareTodayFocusForToday(){
+  const today=localDateKey();
+  data.todayFocus=Array.isArray(data.todayFocus)?data.todayFocus:[];
+  let changed=false;
+  data.todayFocus.forEach(item=>{
+    if(!item.completed && item.forDate!==today){item.forDate=today;changed=true;}
+  });
+  if(changed)saveData();
+}
+function addTodayFocusItem(event){
+  event?.preventDefault();
+  const input=document.getElementById('todayFocusInput');
+  const name=input?.value.trim();if(!name)return;
+  data.todayFocus=Array.isArray(data.todayFocus)?data.todayFocus:[];
+  data.todayFocus.push({id:uid(),name,completed:false,forDate:localDateKey(),createdAt:new Date().toISOString()});
+  if(input)input.value='';saveData();renderTodayFocus();updateProgress();input?.focus();
+}
+function toggleTodayFocusItem(id){
+  const item=(data.todayFocus||[]).find(x=>String(x.id)===String(id));if(!item)return;
+  item.completed=!item.completed;item.completedAt=item.completed?new Date().toISOString():'';item.forDate=localDateKey();
+  saveData();renderTodayFocus();
+}
+function deleteTodayFocusItem(id){
+  data.todayFocus=(data.todayFocus||[]).filter(x=>String(x.id)!==String(id));saveData();renderTodayFocus();
+}
+function clearCompletedTodayFocus(){
+  data.todayFocus=(data.todayFocus||[]).filter(x=>!x.completed);saveData();renderTodayFocus();
+}
+function renderTodayFocus(){
+  const area=document.getElementById('todayFocusArea');if(!area)return;area.innerHTML='';
+  const items=[...(data.todayFocus||[])].sort((a,b)=>Number(a.completed)-Number(b.completed)||String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
+  if(!items.length){area.innerHTML='<div class="empty-state">Your Focus is clear. Add a practical job when you are ready.</div>';return;}
+  items.forEach(item=>{
+    const row=document.createElement('div');row.className=`v10-row today-focus-row ${item.completed?'completed-row':''}`;
+    row.innerHTML=`<button type="button" class="complete-dot" onclick="toggleTodayFocusItem('${item.id}')" aria-label="${item.completed?'Reinstate':'Complete'} ${escapeHtml(item.name)}">${item.completed?'✓':''}</button><button type="button" class="v10-row-main" onclick="toggleTodayFocusItem('${item.id}')"><span class="v10-row-title">${escapeHtml(item.name)}</span><span class="v10-row-meta">${item.completed?'Completed — tap to reinstate':'Today'}</span></button>${compactMenu(`<button onclick="closeAnchoredMenu();toggleTodayFocusItem('${item.id}')">${item.completed?'Reinstate':'Complete'}</button><button class="danger-text" onclick="closeAnchoredMenu();deleteTodayFocusItem('${item.id}')">Delete</button>`,item.name)}`;
+    area.appendChild(row);
+  });
+  if(items.some(x=>x.completed))area.insertAdjacentHTML('beforeend','<button type="button" class="small-button secondary-button clear-focus-completed" onclick="clearCompletedTodayFocus()">Remove completed items</button>');
+}
+function getHomePanelStates(){try{return JSON.parse(localStorage.getItem('myLifePlannerHomePanels')||'{}')}catch{return {}}}
+function saveHomePanelStates(state){localStorage.setItem('myLifePlannerHomePanels',JSON.stringify(state));}
+function applyHomePanelState(panel,collapsed){
+  panel.classList.toggle('home-section-collapsed',collapsed);
+  const button=panel.querySelector('.home-collapse-toggle');
+  if(button){button.textContent=collapsed?'Show':'Hide';button.setAttribute('aria-expanded',String(!collapsed));}
+}
+function toggleHomePanel(key){const panel=document.querySelector(`[data-home-section="${key}"]`);if(!panel)return;const state=getHomePanelStates();state[key]=!panel.classList.contains('home-section-collapsed');saveHomePanelStates(state);applyHomePanelState(panel,state[key]);}
+function initialiseHomeCollapsibles(){
+  const state=getHomePanelStates();
+  document.querySelectorAll('.home-collapsible').forEach(panel=>{
+    const key=panel.dataset.homeSection;if(!key)return;
+    const heading=panel.querySelector(':scope > .section-heading,:scope > .focus-heading');if(!heading)return;
+    let controls=heading.querySelector(':scope > .home-heading-controls');
+    if(!controls){
+      controls=document.createElement('div');controls.className='home-heading-controls';
+      [...heading.children].filter(child=>child!==controls && (child.matches('button') || child.classList.contains('section-actions'))).forEach(child=>controls.appendChild(child));
+      heading.appendChild(controls);
+    }
+    let button=controls.querySelector('.home-collapse-toggle');
+    if(!button){button=document.createElement('button');button.type='button';button.className='small-button secondary-button home-collapse-toggle';button.onclick=()=>toggleHomePanel(key);controls.appendChild(button);}
+    applyHomePanelState(panel,Boolean(state[key]));
+  });
+}
+function focusCandidateRows(){
+  const rows=[];
+  const today=new Date(); today.setHours(12,0,0,0);
+  data.todos.filter(x=>!x.completed).forEach(x=>rows.push({name:x.name,meta:getTimingText(x),dueDate:x.dueDate,kind:'To-do',action:()=>toggleTodo(x.id),open:()=>editTodo(x.id),score:x.dueDate?daysBetween(today,dateOnly(x.dueDate)):40}));
+  data.cleaningTasks.filter(x=>isDueTodayOrEarlier(x.nextDue)).forEach(x=>rows.push({name:x.name,meta:`Cleaning · ${x.room||'Home'}`,dueDate:x.nextDue,kind:'Cleaning',action:()=>completeCleaning(x.id),open:()=>editCleaning(x.id),score:-2}));
+  data.projects.filter(x=>!x.completed).forEach(p=>{const s=(p.steps||[]).find(x=>!x.completed && !x.pending);if(s)rows.push({name:s.name,meta:`Next action · ${p.name}`,dueDate:s.dueDate,kind:'Project',action:()=>toggleStep(p.id,s.id),open:()=>editStep(p.id,s.id),score:s.dueDate?daysBetween(today,dateOnly(s.dueDate)):12});});
+  data.waiting.filter(x=>!x.completed&&x.reviewDate&&dateOnly(x.reviewDate)<=today).forEach(x=>rows.push({name:x.name,meta:'Pending note · review due',dueDate:x.reviewDate,kind:'Waiting',open:()=>editCapture('waiting',x.id),score:0}));
+  return rows.sort((a,b)=>a.score-b.score).slice(0,7);
+}
+function makeV10Row(item,{complete=true,menu='' }={}){
+ const row=document.createElement('div'); row.className=`v10-row ${dueClass(item.dueDate)}`;
+ const main=document.createElement('button');main.type='button';main.className='v10-row-main';main.innerHTML=`<span class="v10-row-title">${escapeHtml(item.name)}</span><span class="v10-row-meta">${escapeHtml(item.meta||'')}</span>`; if(item.open)main.onclick=item.open;
+ row.appendChild(main);
+ if(complete&&item.action){const done=document.createElement('button');done.type='button';done.className='complete-dot';done.setAttribute('aria-label',`Mark ${item.name} complete`);done.setAttribute('title','Mark complete');done.innerHTML='';done.onclick=event=>{event.stopPropagation();item.action();};row.prepend(done);}
+ if(menu)row.insertAdjacentHTML('beforeend',menu);
+ return row;
+}
+function renderFocusToday(){const area=document.getElementById('focusTodayArea');if(!area)return;area.innerHTML='';const items=focusCandidateRows();if(!items.length){area.innerHTML='<div class="empty-state calm-empty"><strong>You are clear for now.</strong><span>Capture a thought or add a task when something comes to mind.</span></div>';return;}items.forEach(x=>area.appendChild(makeV10Row(x)));}
+function refreshFocusToday(){renderFocusToday();const el=document.getElementById('focusTodayArea');el?.animate([{opacity:.35,transform:'translateY(4px)'},{opacity:1,transform:'none'}],{duration:260});}
+function getHomeProjectStates(){try{return JSON.parse(localStorage.getItem('myLifePlannerHomeProjects')||'{}')}catch{return {}}}
+function toggleHomeProject(projectId){
+  const state=getHomeProjectStates();
+  state[projectId]=!state[projectId];
+  localStorage.setItem('myLifePlannerHomeProjects',JSON.stringify(state));
+  renderProjectNextActions();
+}
+function renderProjectNextActions(){
+  const area=document.getElementById('projectNextActionsArea');if(!area)return;area.innerHTML='';
+  const projects=(data.projects||[]).filter(p=>!p.completed);
+  if(!projects.length){area.innerHTML='<div class="empty-state">No active projects need your attention.</div>';return;}
+  const openStates=getHomeProjectStates();
+  [...projects].sort(sortByDueDate).forEach(project=>{
+    const steps=Array.isArray(project.steps)?project.steps:[];
+    const completedCount=steps.filter(step=>step.completed).length;
+    const card=document.createElement('section');card.className='home-project-card';
+    const heading=document.createElement('div');heading.className='home-project-heading';
+    heading.innerHTML=`<button type="button" class="home-project-toggle" onclick="toggleHomeProject('${project.id}')" aria-expanded="${Boolean(openStates[project.id])}"><span aria-hidden="true">${openStates[project.id]?'▾':'▸'}</span><span><strong>${escapeHtml(project.name||'Untitled project')}</strong><small>${steps.length?`${completedCount} of ${steps.length} steps`:'No steps yet'}</small></span></button><button type="button" class="small-button secondary-button home-project-manage" onclick="editProject('${project.id}')">Manage</button>`;
+    card.appendChild(heading);
+    const body=document.createElement('div');body.className='home-project-steps';body.hidden=!openStates[project.id];
+    if(!steps.length){body.innerHTML=`<div class="empty-state">No steps yet. Use Manage to add the first step.</div>`;}
+    else steps.forEach(step=>{
+      const row=document.createElement('div');row.className=`v10-row home-project-step ${step.completed?'completed-row':''}`;
+      const pendingLine=step.pending?`<span class="pending-status-line">Pending${step.pendingReason?' — '+escapeHtml(step.pendingReason):''}</span>`:'';
+      row.innerHTML=`<button type="button" class="complete-dot" onclick="toggleStep('${project.id}','${step.id}')" aria-label="${step.completed?'Reinstate':'Complete'} ${escapeHtml(step.name||'step')}">${step.completed?'✓':''}</button><button type="button" class="v10-row-main" onclick="editStep('${project.id}','${step.id}')"><span class="v10-row-title">${escapeHtml(step.name||'Untitled step')}</span><span class="v10-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'} · Tap text to edit</span>${pendingLine}</button>`;
+      body.appendChild(row);
+    });
+    card.appendChild(body);area.appendChild(card);
+  });
+}
+function openCaptureDialog(type='inbox',id=''){
+ const item=(data[type]||[]).find(x=>x.id===id);
+ document.getElementById('captureType').value=type;document.getElementById('captureId').value=id;
+ document.getElementById('captureTitle').textContent=type==='waiting'?(id?'Edit pending note':'Add Pending note'):(id?'Edit Brain Inbox item':'Capture to Brain Inbox');
+ document.getElementById('captureName').value=item?.name||'';document.getElementById('captureNote').value=item?.note||'';
+ document.getElementById('captureTags').value=tagsInputValue(item);document.getElementById('captureDate').value=item?.reviewDate||'';
+ document.getElementById('captureCategory').value=item?.category||'';document.getElementById('captureStatus').value=item?.status||'new';
+ document.getElementById('captureUrl').value=item?.url||'';window.pendingBrainAttachment=item?.attachment||null;renderBrainAttachmentPreview();
+ document.getElementById('waitingDateLabel').classList.toggle('hidden',type!=='waiting');
+ document.getElementById('inboxCaptureOptions').classList.toggle('hidden',type!=='inbox');
+ document.getElementById('brainCaptureHub')?.classList.toggle('hidden',type!=='inbox');
+ document.getElementById('captureConvertActions')?.classList.toggle('hidden',type!=='inbox');
+ const saveBtn=document.querySelector('#captureForm .dialog-actions button:last-child');if(saveBtn)saveBtn.textContent=type==='waiting'?'Save item':'Save to Brain Inbox';
+ document.getElementById('captureDialog').showModal();setTimeout(()=>document.getElementById('captureName').focus(),80);
+}
+function closeCaptureDialog(){window.pendingBrainAttachment=null;document.getElementById('captureDialog')?.close();}
+function editCapture(type,id){openCaptureDialog(type,id);}
+function deleteCapture(type,id){data[type]=data[type].filter(x=>x.id!==id);saveData();renderAll();showSaved('Deleted');}
+function completeWaiting(id){const x=data.waiting.find(x=>x.id===id);if(x)x.completed=!x.completed;saveData();renderAll();}
+function captureDraft(){return {type:document.getElementById('captureType').value,id:document.getElementById('captureId').value,name:document.getElementById('captureName').value.trim(),note:document.getElementById('captureNote').value.trim(),tags:normaliseTags(document.getElementById('captureTags')?.value),reviewDate:document.getElementById('captureDate').value,category:document.getElementById('captureCategory').value.trim(),status:document.getElementById('captureStatus').value,url:normaliseBrainUrl(document.getElementById('captureUrl')?.value||''),attachment:window.pendingBrainAttachment||null};}
+function saveCapture(targetType=''){
+ const d=captureDraft(); if(!d.name){document.getElementById('captureName').focus();return false;}
+ const sourceItem=d.id?(data[d.type]||[]).find(x=>x.id===d.id):null;
+ if(targetType==='appointment'){
+   pendingInboxAppointmentId=d.id||'';
+   pendingInboxDraft=d;
+   closeCaptureDialog();openAppointmentDialog('',d.name,d.note);return true;
+ }
+ const type=targetType||d.type;
+ if(type==='todo')data.todos.unshift({id:uid(),name:d.name,details:d.note,timingType:'none',dueDate:'',completed:false,steps:[],attachment:d.attachment||null,createdAt:new Date().toISOString()});
+ else if(type==='project')data.projects.unshift({id:uid(),name:d.name,details:d.note,timingType:'none',dueDate:'',completed:false,steps:[],attachment:d.attachment||null,createdAt:new Date().toISOString()});
+ else {const list=data[type]||(data[type]=[]),existing=list.find(x=>x.id===d.id);const record={id:existing?.id||uid(),name:d.name,note:d.note,reviewDate:type==='waiting'?d.reviewDate:'',category:type==='inbox'?d.category:'',status:type==='inbox'?d.status:'new',url:type==='inbox'?d.url:'',attachment:type==='inbox'?d.attachment:null,completed:existing?.completed||false,createdAt:existing?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};if(existing)Object.assign(existing,record);else list.unshift(record);}
+ if(targetType&&d.type==='inbox'&&sourceItem)data.inbox=data.inbox.filter(x=>x.id!==d.id);
+ saveData();closeCaptureDialog();renderAll();showSaved(targetType?`Saved as ${targetType==='waiting'?'Pending note':targetType}`:'Saved');return true;
+}
+function saveCaptureAs(type){saveCapture(type);}
+function inboxStatusLabel(status){return status==='processed'?'Processed':status==='progress'?'In progress':'New';}
+function inboxMeta(x){const parts=[];parts.push(inboxStatusLabel(x.status));if(x.category)parts.push(x.category);if(x.url)parts.push('🔗 Website');if(x.attachment)parts.push(`${x.attachment.type?.startsWith('image/')?'🖼️':'📄'} ${x.attachment.name||'Attachment'}`);if(x.createdAt)parts.push(`Captured ${new Date(x.createdAt).toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'short'})}`);if(x.note)parts.push(x.note);return parts.join(' · ');}
+function toggleInboxProcessed(id){const x=data.inbox.find(item=>item.id===id);if(!x)return;x.status=x.status==='processed'?'new':'processed';x.updatedAt=new Date().toISOString();saveData();renderAll();showSaved(x.status==='processed'?'Marked processed':'Returned to inbox');}
+function renderInbox(){const full=document.getElementById('inboxArea'),preview=document.getElementById('inboxPreviewArea');[full,preview].forEach(area=>{if(!area)return;area.innerHTML='';const sorted=[...data.inbox].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));const items=area===preview?sorted.filter(x=>x.status!=='processed').slice(0,3):sorted;if(!items.length){area.innerHTML='<div class="empty-state">Your Brain Inbox is clear.</div>';return;}items.forEach(x=>{const processed=x.status==='processed';const row=makeV10Row({name:x.name,meta:inboxMeta(x),open:()=>editCapture('inbox',x.id)},{complete:false,menu:compactMenu(`<button onclick="closeAnchoredMenu();editCapture('inbox','${x.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleInboxProcessed('${x.id}')">${processed?'Mark as new':'Mark processed'}</button>${x.url?`<button onclick="closeAnchoredMenu();openBrainLink('${x.id}')">Open website</button>`:''}${x.attachment?`<button onclick="closeAnchoredMenu();openBrainAttachment('${x.id}')">Open attachment</button>`:''}<button onclick="closeAnchoredMenu();convertInbox('${x.id}','todo')">Make a to-do</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','project')">Make a project</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','appointment')">Make an appointment</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','waiting')">Move to Pending note</button><button class="danger-text" onclick="closeAnchoredMenu();deleteCapture('inbox','${x.id}')">Delete</button>`,x.name)});if(processed)row.classList.add('processed-inbox-row');area.appendChild(row);});});}
+function renderWaiting(){const area=document.getElementById('waitingArea');if(!area)return;area.innerHTML='';if(!data.waiting.length){area.innerHTML='<div class="empty-state">Nothing is currently waiting for a reply or follow-up.</div>';return;}data.waiting.forEach(x=>area.appendChild(makeV10Row({name:x.name,meta:x.reviewDate?`Review ${formatDate(x.reviewDate)}`:(x.note||'No review date'),dueDate:x.reviewDate,action:()=>completeWaiting(x.id),open:()=>editCapture('waiting',x.id)},{menu:compactMenu(`<button onclick="closeAnchoredMenu();editCapture('waiting','${x.id}')">Edit</button><button onclick="closeAnchoredMenu();completeWaiting('${x.id}')">${x.completed?'Mark active':'Complete'}</button><button class="danger-text" onclick="closeAnchoredMenu();deleteCapture('waiting','${x.id}')">Delete</button>`,x.name)})));}
+window.pendingBrainAttachment=null;
+function normaliseBrainUrl(value){const text=String(value||'').trim();if(!text)return '';try{return new URL(/^https?:\/\//i.test(text)?text:`https://${text}`).href;}catch(error){return text;}}
+function focusWebsiteCapture(){document.getElementById('captureUrl')?.focus();}
+function chooseBrainAttachment(accept='*/*',capture=''){const input=document.getElementById('brainAttachmentInput');if(!input)return;input.value='';input.accept=accept;if(capture)input.setAttribute('capture',capture);else input.removeAttribute('capture');input.click();}
+async function handleBrainAttachment(event){
+ const file=event.target.files?.[0];if(!file)return;
+ try{
+  if(file.type?.startsWith('image/')){
+   const reduced=await prepareBrainImage(file);
+   window.pendingBrainAttachment=reduced;
+   renderBrainAttachmentPreview();
+   showSaved(reduced.originalSize>reduced.size?`Image reduced from ${formatFileSize(reduced.originalSize)} to ${formatFileSize(reduced.size)}`:'Image ready');
+   return;
+  }
+  if(file.size>1572864){alert('That document is too large for safe on-device storage. Please choose a document under 1.5 MB.');event.target.value='';return;}
+  const dataUrl=await readFileAsDataUrl(file);
+  window.pendingBrainAttachment={name:file.name||'Attachment',type:file.type||'application/octet-stream',size:file.size,data:dataUrl};renderBrainAttachmentPreview();
+ }catch(error){console.error(error);alert('The attachment could not be prepared. Please try another file.');event.target.value='';}
+}
+function readFileAsDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||''));reader.onerror=reject;reader.readAsDataURL(file);});}
+function loadImageFromDataUrl(src){return new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=reject;image.src=src;});}
+function dataUrlByteSize(dataUrl){const base64=(dataUrl.split(',')[1]||'');return Math.max(0,Math.floor(base64.length*3/4));}
+function formatFileSize(bytes){return bytes>=1048576?`${(bytes/1048576).toFixed(1)} MB`:`${Math.max(1,Math.round(bytes/1024))} KB`;}
+async function prepareBrainImage(file){
+ const originalData=await readFileAsDataUrl(file);const image=await loadImageFromDataUrl(originalData);
+ const maxDimension=1200;const scale=Math.min(1,maxDimension/Math.max(image.naturalWidth||image.width,image.naturalHeight||image.height));
+ const width=Math.max(1,Math.round((image.naturalWidth||image.width)*scale));const height=Math.max(1,Math.round((image.naturalHeight||image.height)*scale));
+ const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;const ctx=canvas.getContext('2d');ctx.drawImage(image,0,0,width,height);
+ let quality=.76;let data=canvas.toDataURL('image/jpeg',quality);const target=360*1024;
+ while(dataUrlByteSize(data)>target&&quality>.36){quality-=.07;data=canvas.toDataURL('image/jpeg',quality);}
+ let size=dataUrlByteSize(data);if(size>650*1024)throw new Error('Compressed image remains too large');
+ const base=(file.name||'image').replace(/\.[^.]+$/,'');return{name:`${base}-planner.jpg`,type:'image/jpeg',size,data,originalSize:file.size,width,height,compressed:true};
+}
+function renderBrainAttachmentPreview(){const area=document.getElementById('brainAttachmentPreview');if(!area)return;const attachment=window.pendingBrainAttachment;if(!attachment){area.classList.add('hidden');area.innerHTML='';return;}const size=formatFileSize(attachment.size||0);const reduction=attachment.originalSize&&attachment.originalSize>attachment.size?` <small class="attachment-reduction">(reduced from ${formatFileSize(attachment.originalSize)})</small>`:'';const image=attachment.type?.startsWith('image/');const thumb=image?`<button type="button" class="attachment-thumb-button" onclick="showAttachmentViewer(window.pendingBrainAttachment)" aria-label="Open attached image"><img src="${attachment.data}" alt="Selected attachment preview"></button>`:`<button type="button" class="attachment-file-open" onclick="showAttachmentViewer(window.pendingBrainAttachment)"><span class="attachment-file-icon" aria-hidden="true">📄</span></button>`;area.innerHTML=`${thumb}<span><strong>${escapeHtml(attachment.name||'Attachment')}</strong><small>${size}${reduction}</small><small class="attachment-open-hint">${image?'Tap image to view':'Tap document to open'}</small></span><button type="button" onclick="removeBrainAttachment()" aria-label="Remove attachment">×</button>`;area.classList.remove('hidden');}
+function removeBrainAttachment(){window.pendingBrainAttachment=null;const input=document.getElementById('brainAttachmentInput');if(input)input.value='';renderBrainAttachmentPreview();}
+function openBrainLink(id){const item=data.inbox.find(x=>x.id===id);if(!item?.url)return;window.open(normaliseBrainUrl(item.url),'_blank','noopener');}
+window.currentBrainAttachment=null;window.currentAttachmentObjectUrl='';
+function dataUrlToBlob(dataUrl){const parts=dataUrl.split(',');const match=parts[0].match(/data:([^;]+)/);const type=match?.[1]||'application/octet-stream';const binary=atob(parts[1]||'');const bytes=new Uint8Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);return new Blob([bytes],{type});}
+function openBrainAttachment(id){const item=data.inbox.find(x=>x.id===id);if(!item?.attachment?.data)return;showAttachmentViewer(item.attachment);}
+function showAttachmentViewer(attachment){
+ closeAttachmentViewer(false);window.currentBrainAttachment=attachment;const dialog=document.getElementById('attachmentViewerDialog');const body=document.getElementById('attachmentViewerBody');const title=document.getElementById('attachmentViewerTitle');if(!dialog||!body)return;
+ title.textContent=attachment.name||'Attachment';body.innerHTML='';const type=attachment.type||'';
+ if(type.startsWith('image/')){const img=document.createElement('img');img.src=attachment.data;img.alt=attachment.name||'Attachment preview';body.appendChild(img);}
+ else if(type==='application/pdf'){const blob=dataUrlToBlob(attachment.data);window.currentAttachmentObjectUrl=URL.createObjectURL(blob);const frame=document.createElement('iframe');frame.src=window.currentAttachmentObjectUrl;frame.title=attachment.name||'PDF preview';body.appendChild(frame);}
+ else if(type.startsWith('text/')){const blob=dataUrlToBlob(attachment.data);blob.text().then(text=>{const pre=document.createElement('pre');pre.textContent=text;body.replaceChildren(pre);});}
+ else{body.innerHTML='<div class="empty-state"><strong>Preview is not available for this file type.</strong><p>Use Download copy to open it in another app.</p></div>';}
+ dialog.showModal();
+}
+function closeAttachmentViewer(closeDialog=true){if(window.currentAttachmentObjectUrl){URL.revokeObjectURL(window.currentAttachmentObjectUrl);window.currentAttachmentObjectUrl='';}if(closeDialog)document.getElementById('attachmentViewerDialog')?.close();}
+function downloadCurrentAttachment(){const attachment=window.currentBrainAttachment;if(!attachment?.data)return;const link=document.createElement('a');link.href=attachment.data;link.download=attachment.name||'attachment';document.body.appendChild(link);link.click();link.remove();}
+function brainInboxShortcutUrl(){const url=new URL(location.href);url.search='';url.hash='';url.searchParams.set('open','brain-inbox');return url.href;}
+function refreshBrainShortcutUrl(){const input=document.getElementById('brainShortcutUrl');if(input)input.value=brainInboxShortcutUrl();}
+async function copyBrainInboxShortcut(){const value=brainInboxShortcutUrl();try{await navigator.clipboard.writeText(value);showSaved('Brain Inbox address copied');}catch{const input=document.getElementById('brainShortcutUrl');input?.select();document.execCommand('copy');showSaved('Brain Inbox address copied');}}
+function openBrainInboxShortcut(){location.href=brainInboxShortcutUrl();}
+
+function requestedBrainInboxLaunch(){const params=new URLSearchParams(location.search);return params.get('open')==='brain'||params.get('open')==='brain-inbox'||location.hash==='#brain-inbox';}
+function openRequestedLaunch(){if(!requestedBrainInboxLaunch())return false;showAppView('tasks');setTimeout(()=>{document.getElementById('inboxListSection')?.scrollIntoView({block:'start'});openCaptureDialog('inbox');},180);return true;}
+function startVoiceCapture(type=''){
+ if(type) openCaptureDialog(type);
+ const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!SpeechRecognition){alert('Voice dictation is not supported by this browser. You can use the microphone button on your phone keyboard instead.');return;}
+ const r=new SpeechRecognition();r.lang='en-GB';r.interimResults=false;r.maxAlternatives=1;
+ const mic=document.querySelector('.capture-mic');mic?.classList.add('listening');
+ r.onresult=e=>{const text=e.results[0][0].transcript.trim();const input=document.getElementById('captureName');input.value=input.value?`${input.value} ${text}`:text;input.dispatchEvent(new Event('input'));};
+ r.onerror=()=>alert('I could not hear that clearly. Please try again or use your keyboard microphone.');
+ r.onend=()=>mic?.classList.remove('listening');r.start();
+}
+document.getElementById('captureForm')?.addEventListener('submit',e=>{e.preventDefault();saveCapture();});
+
+
+/* ===== Version 10.3 My Lists control centre ===== */
+function updateListHubCounts(){
+ const simple={annualHubCount:data.annualDates.length,appointmentHubCount:(data.appointments||[]).length,inboxHubCount:(data.inbox||[]).length,customHubCount:(data.customLists||[]).reduce((sum,list)=>sum+(list.items||[]).length,0)};
+ Object.entries(simple).forEach(([id,n])=>{const el=document.getElementById(id);if(el)el.textContent=`${n} ${n===1?'item':'items'}`;});
+ const statusCounts={
+   todoHubCount:[data.todos.filter(x=>!x.completed).length,data.todos.filter(x=>x.completed).length],
+   projectHubCount:[data.projects.filter(x=>!x.completed).length,data.projects.filter(x=>x.completed).length],
+   cleaningHubCount:[data.cleaningTasks.length,0],
+   waitingHubCount:[(data.waiting||[]).filter(x=>!x.completed).length,(data.waiting||[]).filter(x=>x.completed).length]
+ };
+ Object.entries(statusCounts).forEach(([id,[active,done]])=>{const el=document.getElementById(id);if(el)el.textContent=done?`${active} active · ${done} completed`:`${active} ${active===1?'item':'items'}`;});
+}
+function openTimelineShortcut(){
+  showAppView('planner');
+  requestAnimationFrame(()=>document.querySelector('.timeline-panel')?.scrollIntoView({behavior:'smooth',block:'start'}));
+}
+function scrollListsToTop(){
+  document.querySelector('.lists-hub')?.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function updateListsScrollCue(){
+ const panel=document.getElementById('listsSideNav');
+ const cue=panel?.querySelector('.lists-scroll-cue');
+ if(!panel||!cue)return;
+ const hasMore=panel.scrollHeight-panel.scrollTop-panel.clientHeight>10;
+ cue.classList.toggle('is-visible',hasMore);
+}
+function toggleListsSideNav(force){
+ const wrap=document.querySelector('.lists-floating-wrap');
+ const toggle=document.querySelector('.lists-rail-toggle');
+ if(!wrap||!toggle)return;
+ const open=typeof force==='boolean'?force:!wrap.classList.contains('nav-open');
+ wrap.classList.toggle('nav-open',open);
+ toggle.setAttribute('aria-expanded',String(open));
+ if(open){
+  requestAnimationFrame(()=>{
+   const panel=document.getElementById('listsSideNav');
+   if(panel)panel.scrollTop=0;
+   updateListsScrollCue();
+  });
+ }
+}
+let listsLayoutResetTimer;
+function resetListsNavigationLayout(){
+ clearTimeout(listsLayoutResetTimer);
+ listsLayoutResetTimer=setTimeout(()=>toggleListsSideNav(false),60);
+}
+window.addEventListener('resize',resetListsNavigationLayout,{passive:true});
+window.addEventListener('orientationchange',()=>{
+ toggleListsSideNav(false);
+ resetListsNavigationLayout();
+},{passive:true});
+if(window.visualViewport)window.visualViewport.addEventListener('resize',resetListsNavigationLayout,{passive:true});
+document.getElementById('listsSideNav')?.addEventListener('scroll',updateListsScrollCue,{passive:true});
+
+document.addEventListener('pointerdown',event=>{
+ const wrap=document.querySelector('.lists-floating-wrap');
+ if(!wrap?.classList.contains('nav-open'))return;
+ if(!wrap.contains(event.target))toggleListsSideNav(false);
+});
+function jumpToList(id){
+ const el=document.getElementById(id);
+ if(!el)return;
+ // A Lists-menu choice must reveal the section before scrolling to it.
+ if(el.classList.contains('list-section-collapsed')){
+   const state=getCollapsedListSections();
+   state[id]=false;
+   saveCollapsedListSections(state);
+   applyListSectionState(el,false);
+ }
+ requestAnimationFrame(()=>{
+   const header=document.querySelector('.app-header');
+   const offset=(header?.getBoundingClientRect().height||0)+14;
+   const top=window.scrollY+el.getBoundingClientRect().top-offset;
+   window.scrollTo({top:Math.max(0,top),behavior:'smooth'});
+   toggleListsSideNav(false);
+   el.classList.add('list-highlight');
+   setTimeout(()=>el.classList.remove('list-highlight'),900);
+ });
+}
+function normaliseSearchText(value=''){return String(value).toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim();}
+function searchTextMatches(text,query){
+ const q=normaliseSearchText(query);if(!q)return true;
+ const haystack=normaliseSearchText(text);const tokens=q.split(/\s+/).filter(Boolean);
+ return tokens.every(token=>haystack.includes(token));
+}
+function filterMyLists(query=''){
+ const search=document.getElementById('globalListSearch');
+ const q=normaliseSearchText(query ?? search?.value ?? '');
+ const sections=[...document.querySelectorAll('.managed-list-section')];
+ let matchingSections=0;
+ sections.forEach(section=>{
+   const rows=[...section.querySelectorAll('.compact-manage-row,.annual-manage-row,.list-card,.v10-row,.custom-list-card,.custom-preview-item,.step-compact-row,.appointment-card')];
+   const headingText=String(section.dataset.listName||section.querySelector('h2')?.textContent||'');
+   const headingMatch=Boolean(q)&&searchTextMatches(headingText,q);
+   let visibleRows=0;
+   rows.forEach(row=>{
+     const match=!q||headingMatch||searchTextMatches(row.textContent||'',q);
+     row.classList.toggle('list-search-hidden',!match);row.hidden=!match;if(match)visibleRows++;
+   });
+   section.querySelectorAll('.project-steps-group').forEach(group=>{
+     const groupMatch=!q||searchTextMatches(group.textContent||'',q);
+     if(q&&groupMatch)group.hidden=false;
+     else if(!q){const state=getProjectStepStates();group.hidden=!state[group.dataset.projectId];}
+   });
+   const show=!q||headingMatch||visibleRows>0;
+   section.classList.toggle('list-search-hidden',!show);section.hidden=!show;
+   if(show)matchingSections++;
+ });
+ const status=document.getElementById('listSearchStatus');
+ if(status)status.textContent=!q?'':matchingSections?`${matchingSections} matching ${matchingSections===1?'section':'sections'}`:'No matching items';
+}
+function initialiseListSearch(){
+ const search=document.getElementById('globalListSearch');
+ if(!search||search.dataset.searchReady==='true')return;
+ search.dataset.searchReady='true';
+ let searchTimer=0;
+ search.addEventListener('input',event=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>filterMyLists(event.target.value),90);});
+ search.addEventListener('search',event=>filterMyLists(event.target.value));
+ search.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();search.value='';filterMyLists('');search.blur();}});
+}
+
+
+
+/* ===== V11.6 core appointments rebuild ===== */
+function appointmentDashboardItems(){
+  return (data.appointments||[]).flatMap(a=>appointmentOccurrences(a, new Date(), 60).map(o=>({id:a.id,name:a.name,details:a.notes||'',source:'Appointment',dueDate:o.date,itemType:'appointment',time:a.time||'',occurrenceDate:o.date})));
+}
+function addMonthsSafe(date,n){const d=new Date(date);const day=d.getDate();d.setDate(1);d.setMonth(d.getMonth()+n);const last=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();d.setDate(Math.min(day,last));return d;}
+function normaliseAppointmentRepeat(a={}){
+  let repeat=a.repeat||'none',unit=a.repeatUnit||'',interval=Math.max(1,Number(a.repeatInterval)||1);
+  if(repeat==='fortnightly'){repeat='weekly';unit='week';interval=2;}
+  if(!unit){unit=repeat==='daily'?'day':repeat==='weekly'?'week':repeat==='monthly'?'month':repeat==='yearly'?'year':'';}
+  if(repeat==='none'||!unit)return{repeat:'none',unit:'',interval:1,endType:'never',endDate:'',count:0};
+  const endType=['never','count','date'].includes(a.repeatEndType)?a.repeatEndType:'never';
+  return{repeat,unit,interval,endType,endDate:a.repeatEndDate||'',count:Math.max(1,Number(a.repeatCount)||10)};
+}
+function advanceAppointmentDate(date,rule){
+  const d=new Date(date);if(rule.unit==='day')d.setDate(d.getDate()+rule.interval);else if(rule.unit==='week')d.setDate(d.getDate()+7*rule.interval);else if(rule.unit==='month')return addMonthsSafe(d,rule.interval);else if(rule.unit==='year')return addMonthsSafe(d,12*rule.interval);return d;
+}
+function appointmentOccurrences(a,from=new Date(),days=400){
+  if(!a||!a.date)return[];const start=dateOnly(a.date);if(isNaN(start))return[];
+  const floor=new Date(from);floor.setHours(0,0,0,0);const end=new Date(floor);end.setDate(end.getDate()+days);
+  const rule=normaliseAppointmentRepeat(a),limitDate=rule.endType==='date'&&rule.endDate?dateOnly(rule.endDate):null;
+  const out=[];let d=new Date(start),occurrence=1,guard=0;
+  while(d<floor&&rule.repeat!=='none'&&guard++<5000){if(rule.endType==='count'&&occurrence>=rule.count)return[];d=advanceAppointmentDate(d,rule);occurrence++;if(limitDate&&d>limitDate)return[];}
+  guard=0;while(d<=end&&guard++<5000){
+    if(limitDate&&d>limitDate)break;if(rule.endType==='count'&&occurrence>rule.count)break;
+    if(d>=floor)out.push({date:localDateKey(d),occurrence});
+    if(rule.repeat==='none')break;d=advanceAppointmentDate(d,rule);occurrence++;
+  }
+  return out;
+}
+function appointmentRepeatDescription(a){
+  const r=normaliseAppointmentRepeat(a);if(r.repeat==='none')return'';
+  const unit=r.unit+(r.interval===1?'':'s');let text=r.interval===1?`every ${unit}`:`every ${r.interval} ${unit}`;
+  if(r.endType==='count')text+=` · ${r.count} appointments`;else if(r.endType==='date'&&r.endDate)text+=` · until ${formatDate(r.endDate)}`;
+  return text;
+}
+function updateAppointmentRepeatControls(){
+  const repeat=document.getElementById('appointmentRepeat'),box=document.getElementById('appointmentRepeatOptions');if(!repeat||!box)return;
+  const active=repeat.value!=='none';box.hidden=!active;
+  const unit=document.getElementById('appointmentRepeatUnit');if(active&&unit){const expected=repeat.value==='daily'?'day':repeat.value==='weekly'?'week':repeat.value==='monthly'?'month':'year';if(unit.dataset.userChanged!=='true')unit.value=expected;}
+  const end=document.getElementById('appointmentRepeatEnd')?.value||'never';document.getElementById('appointmentRepeatCountLabel').hidden=!active||end!=='count';document.getElementById('appointmentRepeatEndDateLabel').hidden=!active||end!=='date';
+  const summary=document.getElementById('appointmentRepeatSummary');if(summary&&active){summary.textContent='Repeats '+appointmentRepeatDescription({repeat:repeat.value,repeatUnit:unit?.value,repeatInterval:document.getElementById('appointmentRepeatInterval')?.value,repeatEndType:end,repeatCount:document.getElementById('appointmentRepeatCount')?.value,repeatEndDate:document.getElementById('appointmentRepeatEndDate')?.value})+'.';}
+}
+function openAppointmentDialog(id='',prefillName='',prefillNotes=''){
+  const a=(data.appointments||[]).find(x=>x.id===id),rule=normaliseAppointmentRepeat(a||{});
+  document.getElementById('appointmentId').value=a?.id||'';
+  document.getElementById('appointmentName').value=a?.name||prefillName||'';
+  document.getElementById('appointmentDate').value=a?.date||localDateKey();
+  document.getElementById('appointmentTime').value=a?.time||'';
+  document.getElementById('appointmentEndTime').value=a?.endTime||'';
+  document.getElementById('appointmentLocation').value=a?.location||'';
+  document.getElementById('appointmentLink').value=a?.link||a?.url||a?.meetingLink||'';
+  document.getElementById('appointmentNotes').value=a?.notes||prefillNotes||'';
+  document.getElementById('appointmentTags').value=tagsInputValue(a);
+  document.getElementById('appointmentRepeat').value=rule.repeat;
+  document.getElementById('appointmentRepeatInterval').value=rule.interval;
+  const unit=document.getElementById('appointmentRepeatUnit');unit.value=rule.unit||'day';unit.dataset.userChanged='false';
+  document.getElementById('appointmentRepeatEnd').value=rule.endType;
+  document.getElementById('appointmentRepeatCount').value=rule.count||10;
+  document.getElementById('appointmentRepeatEndDate').value=rule.endDate||'';
+  document.getElementById('appointmentDialogTitle').textContent=a?'Edit appointment':'Add appointment';
+  const deleteButton=document.getElementById('appointmentDeleteButton');if(deleteButton)deleteButton.hidden=!a;
+  updateAppointmentRepeatControls();
+  const dlg=document.getElementById('appointmentDialog');if(dlg.showModal)dlg.showModal();else dlg.setAttribute('open','');
+  setTimeout(()=>document.getElementById('appointmentName').focus(),50);
+}
+function closeAppointmentDialog(){const d=document.getElementById('appointmentDialog');if(d.open&&d.close)d.close();else d.removeAttribute('open');}
+function saveAppointment(){
+  try{
+    const name=document.getElementById('appointmentName').value.trim(),date=document.getElementById('appointmentDate').value;
+    if(!name){alert('Please enter an appointment title.');document.getElementById('appointmentName').focus();return false;}
+    if(!date){alert('Please choose a date.');document.getElementById('appointmentDate').focus();return false;}
+    const id=document.getElementById('appointmentId').value,existing=(data.appointments||[]).find(x=>x.id===id),link=normaliseAppointmentLink(document.getElementById('appointmentLink').value);
+    if(document.getElementById('appointmentLink').value.trim()&&!link){alert('Please enter a valid meeting or web link.');document.getElementById('appointmentLink').focus();return false;}
+    const repeat=document.getElementById('appointmentRepeat').value,interval=Math.max(1,Number(document.getElementById('appointmentRepeatInterval').value)||1),endType=document.getElementById('appointmentRepeatEnd').value,count=Math.max(1,Number(document.getElementById('appointmentRepeatCount').value)||1),endDate=document.getElementById('appointmentRepeatEndDate').value;
+    if(repeat!=='none'&&endType==='date'&&!endDate){alert('Please choose the repeat end date.');document.getElementById('appointmentRepeatEndDate').focus();return false;}
+    if(repeat!=='none'&&endType==='date'&&dateOnly(endDate)<dateOnly(date)){alert('The repeat end date cannot be before the first appointment.');document.getElementById('appointmentRepeatEndDate').focus();return false;}
+    const rec={id:existing?.id||uid(),name,date,time:document.getElementById('appointmentTime').value,endTime:document.getElementById('appointmentEndTime').value,location:document.getElementById('appointmentLocation').value.trim(),link,notes:document.getElementById('appointmentNotes').value.trim(),tags:normaliseTags(document.getElementById('appointmentTags')?.value),repeat,repeatInterval:repeat==='none'?1:interval,repeatUnit:repeat==='none'?'':document.getElementById('appointmentRepeatUnit').value,repeatEndType:repeat==='none'?'never':endType,repeatCount:repeat!=='none'&&endType==='count'?count:null,repeatEndDate:repeat!=='none'&&endType==='date'?endDate:'',createdAt:existing?.createdAt||new Date().toISOString()};
+    if(existing)Object.assign(existing,rec);else data.appointments.unshift(rec);
+    saveData();closeAppointmentDialog();renderAll();showSaved('Appointment saved');return true;
+  }catch(e){console.error(e);alert('The appointment could not be saved. Please try again.');return false;}
+}
+function normaliseAppointmentLink(value){
+  const raw=(value||'').trim();if(!raw)return '';
+  const candidate=/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)?raw:`https://${raw}`;
+  try{const url=new URL(candidate);return ['http:','https:'].includes(url.protocol)?url.href:'';}catch{return '';}
+}
+function openAppointmentLink(id){const a=(data.appointments||[]).find(x=>String(x.id)===String(id));const link=normaliseAppointmentLink(a?.link||a?.url||a?.meetingLink||'');if(link)window.open(link,'_blank','noopener,noreferrer');}
+function deleteAppointment(id){if(!confirm('Delete this appointment?'))return;data.appointments=data.appointments.filter(x=>String(x.id)!==String(id));saveData();renderAll();}
+function deleteAppointmentFromDialog(){
+  const id=document.getElementById('appointmentId')?.value;
+  if(!id)return;
+  const appointment=(data.appointments||[]).find(x=>String(x.id)===String(id));
+  const repeating=appointment&&normaliseAppointmentRepeat(appointment).repeat!=='none';
+  const message=repeating?'Delete this repeating appointment and all of its occurrences?':'Delete this appointment?';
+  if(!confirm(message))return;
+  data.appointments=(data.appointments||[]).filter(x=>String(x.id)!==String(id));
+  saveData();closeAppointmentDialog();renderAll();showSaved('Appointment deleted');
+}
+
+function renderAppointments(){
+  const area=document.getElementById('appointmentsArea');if(!area)return;area.innerHTML='';
+  const items=[...(data.appointments||[])].sort((a,b)=>((a.date||'')+(a.time||'')).localeCompare((b.date||'')+(b.time||'')));
+  if(!items.length){area.innerHTML='<div class="empty-state">No appointments are saved yet.</div>';return;}
+  items.forEach(a=>{
+    const link=normaliseAppointmentLink(a.link||a.url||a.meetingLink||'');
+    const row=document.createElement('article');row.className='appointment-card';
+    const timeText=a.time?`${a.time}${a.endTime?'–'+a.endTime:''}`:'All day';
+    row.innerHTML=`<div class="appointment-card-main"><button class="appointment-open" onclick="openAppointmentDialog('${a.id}')"><span class="appointment-date">${escapeHtml(formatDate(a.date))}</span><span class="appointment-title">${escapeHtml(a.name)}</span><span class="appointment-meta">${escapeHtml(timeText)}${a.location?' · '+escapeHtml(a.location):''}${appointmentRepeatDescription(a)?' · '+escapeHtml(appointmentRepeatDescription(a)):''}</span>${a.notes?`<span class="appointment-notes">${escapeHtml(a.notes)}</span>`:''}</button>${compactMenu(`<button onclick="closeAnchoredMenu();openAppointmentDialog('${a.id}')">Edit</button>${link?`<button onclick="closeAnchoredMenu();openAppointmentLink('${a.id}')">Open link</button>`:''}<button class="danger-text" onclick="closeAnchoredMenu();deleteAppointment('${a.id}')">Delete</button>`,a.name)}</div>${link?`<button class="appointment-link-button" type="button" onclick="openAppointmentLink('${a.id}')">Open meeting or web link</button>`:''}`;
+    area.appendChild(row);
+  });
+}
+// Timeline controls. Constants are initialised at the top of the file before the first render.
+function setTimelineRange(range,button){
+  timelineRange=range;
+  document.querySelectorAll('.timeline-filter').forEach(b=>b.classList.toggle('active',b.dataset.range===range));
+  if(button)button.classList.add('active');
+  renderTimeline();
+}
+function timelineDateBounds(range){
+  const today=dateOnly(localDateKey()),start=new Date(today),end=new Date(today);
+  if(range==='tomorrow'){start.setDate(start.getDate()+1);end.setDate(end.getDate()+1);}
+  else if(range==='week')end.setDate(end.getDate()+6);
+  else if(range==='month')end.setMonth(end.getMonth()+1,0);
+  else if(range==='all')end.setDate(end.getDate()+365);
+  return {start,end};
+}
+function timelineItems(){
+  const today=new Date();today.setHours(0,0,0,0);
+  const items=[];
+  const add=(item)=>{
+    if(!item||!item.date)return;
+    const parsed=dateOnly(String(item.date).slice(0,10));
+    if(!parsed)return;
+    items.push({...item,date:localDateKey(parsed),name:String(item.name||'Untitled item')});
+  };
+  try{
+    (data.appointments||[]).forEach(a=>{
+      appointmentOccurrences(a,today,365).forEach(o=>add({id:a.id,type:'appointment',name:a.name||a.title,date:o.date,time:a.time||'',detail:[a.endTime&&a.time?`${a.time}–${a.endTime}`:a.time,a.location].filter(Boolean).join(' · '),open:()=>openAppointmentDialog(a.id)}));
+    });
+  }catch(error){console.warn('Timeline appointments skipped',error);}
+  (data.todos||[]).filter(x=>!x.completed&&(x.dueDate||x.date)).forEach(x=>add({id:x.id,type:'todo',name:x.name||x.title,date:x.dueDate||x.date,detail:x.details||x.notes||'',open:()=>editTodo(x.id)}));
+  (data.projects||[]).filter(x=>!x.completed&&(x.dueDate||x.targetDate||x.date)).forEach(x=>add({id:x.id,type:'project',name:x.name||x.title,date:x.dueDate||x.targetDate||x.date,detail:x.details||x.notes||'',open:()=>editProject(x.id)}));
+  (data.cleaningTasks||[]).filter(x=>!x.completed&&(x.nextDue||x.dueDate||x.date)).forEach(x=>add({id:x.id,type:'cleaning',name:x.name||x.title,date:x.nextDue||x.dueDate||x.date,detail:x.room||x.area||'Home',open:()=>editCleaning(x.id)}));
+  (data.recurringTasks||[]).filter(x=>x.status!=='paused'&&x.nextDue).forEach(x=>add({id:x.id,type:'recurring',name:x.name||'Recurring task',date:x.nextDue,detail:recurringPatternLabel(x),open:()=>openRecurringTaskDialog(x.id)}));
+  (data.annualDates||[]).forEach(x=>{
+    try{const d=nextAnnualOccurrence(String(x.monthDay||''));if(d)add({id:x.id,type:'annual',name:x.name||x.title,date:localDateKey(d),detail:x.details||x.notes||'',open:()=>editAnnual(x.id)});}catch(error){console.warn('Timeline annual date skipped',error);}
+  });
+  (data.waiting||[]).filter(x=>!x.completed&&(x.reviewDate||x.dueDate||x.date)).forEach(x=>add({id:x.id,type:'waiting',name:x.name||x.title,date:x.reviewDate||x.dueDate||x.date,detail:x.note||x.details||'Review due',open:()=>editCapture('waiting',x.id)}));
+  return items.sort((a,b)=>`${a.date}${a.time||'99:99'}${a.name}`.localeCompare(`${b.date}${b.time||'99:99'}${b.name}`));
+}
+function renderTimeline(){
+  const area=document.getElementById('timelineArea'),summary=document.getElementById('timelineSummary');if(!area)return;
+  const {start,end}=timelineDateBounds(timelineRange),today=dateOnly(localDateKey());
+  const allItems=timelineItems();
+  const includeOverdue=['today','week','month','all'].includes(timelineRange);
+  const overdue=includeOverdue?allItems.filter(x=>dateOnly(x.date)<today):[];
+  const dated=allItems.filter(x=>{const d=dateOnly(x.date);return d>=start&&d<=end;});
+  const seen=new Set(),items=[...overdue,...dated].filter(x=>{const k=`${x.type}:${x.id}:${x.date}`;if(seen.has(k))return false;seen.add(k);return true;});
+  area.innerHTML='';
+  const labels={today:'today including overdue',tomorrow:'tomorrow',week:'in the next 7 days including overdue',month:'this month including overdue',all:'in the next year including overdue'};
+  if(summary)summary.textContent=`${items.length} ${items.length===1?'item':'items'} ${labels[timelineRange]}.`;
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing dated for this period.</div>';return;}
+  const appendRow=(item)=>{
+    const type=TIMELINE_TYPES[item.type]||{icon:'•',label:'Planner item'},row=document.createElement('button');row.type='button';row.className=`timeline-item timeline-${item.type}`;row.onclick=item.open;
+    row.innerHTML=`<span class="timeline-icon" aria-hidden="true">${type.icon}</span><span class="timeline-copy"><strong>${escapeHtml(item.name)}</strong><span class="timeline-meta">${escapeHtml(type.label)}${item.time?' · '+escapeHtml(item.time):''}${item.detail?' · '+escapeHtml(item.detail):''}</span></span><span class="timeline-chevron" aria-hidden="true">›</span>`;
+    area.appendChild(row);
+  };
+  if(overdue.length){const h=document.createElement('h3');h.className='timeline-date-heading timeline-overdue-heading';h.textContent='Overdue';area.appendChild(h);overdue.forEach(appendRow);}
+  let current='';
+  dated.forEach(item=>{
+    if(item.date!==current){current=item.date;const h=document.createElement('h3');h.className='timeline-date-heading';h.textContent=formatDate(item.date);area.appendChild(h);}
+    appendRow(item);
+  });
+}
+
+/* Safe Brain Inbox conversion: an inbox item is only removed after the destination is saved. */
+let pendingInboxAppointmentId='';
+let pendingInboxDraft=null;
+function convertInbox(id,type){
+  const x=data.inbox.find(item=>item.id===id);if(!x)return;
+  if(type==='appointment'){
+    pendingInboxAppointmentId=id;pendingInboxDraft=null;
+    openAppointmentDialog('',x.name,x.note||'');
+    return;
+  }
+  if(type==='todo')data.todos.unshift({id:uid(),name:x.name,details:x.note||'',timingType:'none',dueDate:'',completed:false,steps:[],attachment:x.attachment||null});
+  else if(type==='project')data.projects.unshift({id:uid(),name:x.name,details:x.note||'',timingType:'none',dueDate:'',completed:false,steps:[],attachment:x.attachment||null});
+  else data.waiting.unshift({id:uid(),name:x.name,note:x.note||'',reviewDate:'',completed:false});
+  data.inbox=data.inbox.filter(item=>item.id!==id);saveData();renderAll();showSaved('Thought converted');
+}
+const saveAppointmentCore=saveAppointment;
+saveAppointment=function(){
+  const saved=saveAppointmentCore();
+  if(saved&&pendingInboxAppointmentId){data.inbox=data.inbox.filter(x=>x.id!==pendingInboxAppointmentId);pendingInboxAppointmentId='';pendingInboxDraft=null;saveData();renderAll();}
+  else if(saved&&pendingInboxDraft){pendingInboxDraft=null;}
+  return saved;
+};
+const closeAppointmentDialogCore=closeAppointmentDialog;
+closeAppointmentDialog=function(){pendingInboxAppointmentId='';pendingInboxDraft=null;closeAppointmentDialogCore();};
+
+
+/* ===== Authoritative Lists renderers =====
+   Lists and Home read from the same live data objects. */
+function renderTodos() {
+  const area = document.getElementById('todoArea');
+  if (!area) return;
+  area.innerHTML = '';
+  const items = Array.isArray(data.todos) ? data.todos : [];
+  if (!items.length) {
+    area.innerHTML = '<div class="empty-state">Your to-do list is clear.</div>';
+    return;
+  }
+  [...items].sort(sortByDueDate).forEach(todo => {
+    const row = document.createElement('div');
+    row.className = `compact-manage-row ${todo.completed ? 'completed-row' : ''}`;
+    const timing = escapeHtml(getTimingText(todo) || 'No date');
+    const details = todo.details ? ` · ${escapeHtml(todo.details)}` : '';
+    const pendingLine = todo.pending ? `<span class="pending-status-line">Pending${todo.pendingReason ? ' — '+escapeHtml(todo.pendingReason) : ''}</span>` : '';
+    const pendingAction = !todo.completed ? `<button onclick="closeAnchoredMenu();toggleTodoPending('${todo.id}')">${todo.pending ? 'Mark active' : 'Mark pending'}</button>` : '';
+    const actions = `<button onclick="closeAnchoredMenu();toggleTodo('${todo.id}');refreshListsImmediately()">${todo.completed ? 'Mark incomplete' : 'Complete'}</button>${pendingAction}<button onclick="closeAnchoredMenu();editTodo('${todo.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();deleteTodo('${todo.id}');refreshListsImmediately()">Delete</button>`;
+    row.innerHTML = `<button type="button" class="compact-row-main" onclick="editTodo('${todo.id}')"><span class="compact-row-title">${escapeHtml(todo.name || 'Untitled to-do')}</span><span class="compact-row-meta">${timing}${details}</span>${pendingLine}</button>${compactMenu(actions,todo.name || 'to-do')}`;
+    area.appendChild(row);
+
+    const steps = Array.isArray(todo.steps) ? todo.steps : [];
+    steps.forEach((step,index) => {
+      const stepRow=document.createElement('div');
+      stepRow.className=`compact-manage-row nested-compact-row ${step.completed?'completed-row':''}`;
+      const stepActions=`<button onclick="closeAnchoredMenu();toggleTodoStep('${todo.id}','${step.id}');refreshListsImmediately()">${step.completed?'Mark incomplete':'Complete'}</button><button onclick="closeAnchoredMenu();editTodo('${todo.id}')">Edit to-do</button>`;
+      stepRow.innerHTML=`<button type="button" class="compact-row-main" onclick="toggleTodoStep('${todo.id}','${step.id}');refreshListsImmediately()"><span class="compact-row-title">${index+1}. ${escapeHtml(step.name||'Untitled step')}</span><span class="compact-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'}</span></button>${compactMenu(stepActions,step.name||'step')}`;
+      area.appendChild(stepRow);
+    });
+  });
+}
+
+function getProjectStepStates(){try{return JSON.parse(localStorage.getItem('myLifePlannerProjectSteps')||'{}')}catch{return {}}}
+function toggleProjectSteps(projectId){const state=getProjectStepStates();state[projectId]=!state[projectId];localStorage.setItem('myLifePlannerProjectSteps',JSON.stringify(state));renderProjects();}
+function renderProjects() {
+  const area = document.getElementById('projectsArea');
+  if (!area) return;
+  area.innerHTML = '';
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  if (!projects.length) { area.innerHTML = '<div class="empty-state">No projects are saved yet.</div>'; return; }
+  const openStates=getProjectStepStates();
+  [...projects].sort(sortByDueDate).forEach(project => {
+    const steps = Array.isArray(project.steps) ? project.steps : [];
+    const genuinelyComplete = steps.length > 0 && steps.every(step => step.completed);
+    project.completed = genuinelyComplete;
+    const completedCount=steps.filter(step=>step.completed).length;
+    const row=document.createElement('div');row.className=`compact-manage-row project-compact-row ${genuinelyComplete?'completed-row':''}`;
+    const projectActions=`<button onclick="closeAnchoredMenu();openAddDialog('step','${project.id}')">Add step</button><button onclick="closeAnchoredMenu();editProject('${project.id}')">Edit project</button><button onclick="closeAnchoredMenu();saveProjectAsTemplate('${project.id}')">Save as template</button><button class="danger-text" onclick="closeAnchoredMenu();deleteProject('${project.id}');refreshListsImmediately()">Delete project</button>`;
+    row.innerHTML=`<button type="button" class="project-expand-button" onclick="toggleProjectSteps('${project.id}')" aria-expanded="${Boolean(openStates[project.id])}" aria-label="${openStates[project.id]?'Hide':'Show'} steps">${openStates[project.id]?'▾':'▸'}</button><button type="button" class="compact-row-main" onclick="toggleProjectSteps('${project.id}')"><span class="compact-row-title">${escapeHtml(project.name||'Untitled project')}</span><span class="compact-row-meta">${steps.length?`${completedCount} of ${steps.length} steps`:'No steps'}${project.details?' · '+escapeHtml(project.details):''}</span></button>${compactMenu(projectActions,project.name||'project')}`;
+    area.appendChild(row);
+    const group=document.createElement('div');group.className='project-steps-group';group.dataset.projectId=project.id;group.hidden=!openStates[project.id];
+    steps.forEach((step,index)=>{
+      const stepRow=document.createElement('div');stepRow.className=`compact-manage-row nested-compact-row ${step.completed?'completed-row':''}`;
+      const stepActions=`<button onclick="closeAnchoredMenu();toggleStep('${project.id}','${step.id}');refreshListsImmediately()">${step.completed?'Mark incomplete':'Complete step'}</button><button onclick="closeAnchoredMenu();editStep('${project.id}','${step.id}')">Edit step</button><button class="danger-text" onclick="closeAnchoredMenu();deleteStep('${project.id}','${step.id}');refreshListsImmediately()">Delete step</button>`;
+      stepRow.innerHTML=`<button type="button" class="compact-row-main" onclick="toggleStep('${project.id}','${step.id}');refreshListsImmediately()"><span class="compact-row-title">${index+1}. ${escapeHtml(step.name||'Untitled step')}</span><span class="compact-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'}</span></button>${compactMenu(stepActions,step.name||'project step')}`;
+      group.appendChild(stepRow);
+    });
+    area.appendChild(group);
+  });
+}
+function toggleStep(projectId, stepId) {
+  const project = (data.projects || []).find(item => item.id === projectId);
+  const step = project && (project.steps || []).find(item => item.id === stepId);
+  if (!project || !step) return;
+  step.completed = !step.completed;
+  project.completed = (project.steps || []).length > 0 && project.steps.every(item => item.completed);
+  saveData();
+  renderAll();
+}
+
+function completeCleaning(id) {
+  const task = (data.cleaningTasks || []).find(item => item.id === id);
+  if (!task) return;
+  const completedOn = localDateKey ? localDateKey() : new Date().toISOString().slice(0,10);
+  task.lastCompleted = completedOn;
+  task.nextDue = nextCleaningDate(task.nextDue || completedOn, task.frequency || 'weekly');
+  saveData();
+  renderAll();
+}
+
+const CLEANING_AREA_VIEW_KEY='myLifePlannerCleaningAreaView';
+function cleaningAreaView(){try{return {...{filter:'all',group:false},...JSON.parse(localStorage.getItem(CLEANING_AREA_VIEW_KEY)||'{}')}}catch{return {filter:'all',group:false}}}
+function saveCleaningAreaView(view){try{localStorage.setItem(CLEANING_AREA_VIEW_KEY,JSON.stringify(view));}catch(e){}}
+function cleaningAreaName(item){return String(item?.room||'').trim()||'Unassigned';}
+function cleaningAreaKey(name){return String(name||'Unassigned').trim().toLocaleLowerCase();}
+function cleaningAreaOptions(items){
+  const map=new Map();
+  items.forEach(item=>{const name=cleaningAreaName(item),key=cleaningAreaKey(name);if(!map.has(key))map.set(key,{key,name,count:0});map.get(key).count++;});
+  return [...map.values()].sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:'base'}));
+}
+function setCleaningAreaFilter(value){const view=cleaningAreaView();view.filter=value||'all';saveCleaningAreaView(view);renderCleaning();}
+function setCleaningGroupByArea(checked){const view=cleaningAreaView();view.group=Boolean(checked);saveCleaningAreaView(view);renderCleaning();}
+function cleaningTaskRow(item){
+  const dueNow=isDueTodayOrEarlier(item.nextDue),row=document.createElement('div');
+  row.className=`compact-manage-row ${dueNow?'status-overdue':''}`;
+  const room=cleaningAreaName(item);
+  const meta=`${escapeHtml(room)} · ${escapeHtml(frequencyLabel(item.frequency||'weekly'))} · Next due ${item.nextDue?formatDate(item.nextDue):'not set'}${item.details?' · '+escapeHtml(item.details):''}`;
+  const actions=`<button onclick="closeAnchoredMenu();completeCleaning('${item.id}');refreshListsImmediately()">Complete</button><button onclick="closeAnchoredMenu();editCleaning('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();deleteCleaning('${item.id}');refreshListsImmediately()">Delete</button>`;
+  row.innerHTML=`<button type="button" class="compact-row-main" onclick="editCleaning('${item.id}')"><span class="compact-row-title">${escapeHtml(item.name||'Untitled cleaning task')}</span><span class="compact-row-meta">${meta}</span></button>${compactMenu(actions,item.name||'cleaning task')}`;
+  return row;
+}
+function renderCleaning() {
+  const area=document.getElementById('cleaningArea');if(!area)return;area.innerHTML='';
+  const items=Array.isArray(data.cleaningTasks)?data.cleaningTasks:[];
+  const options=cleaningAreaOptions(items),view=cleaningAreaView();
+  const select=document.getElementById('cleaningAreaFilter'),chips=document.getElementById('cleaningAreaChips'),groupToggle=document.getElementById('cleaningGroupByArea'),summary=document.getElementById('cleaningAreaSummary');
+  if(select){select.innerHTML='<option value="all">All areas</option>'+options.map(o=>`<option value="${escapeHtml(o.key)}">${escapeHtml(o.name)} (${o.count})</option>`).join('');if(view.filter!=='all'&&!options.some(o=>o.key===view.filter))view.filter='all';select.value=view.filter;}
+  if(groupToggle)groupToggle.checked=Boolean(view.group);
+  if(chips){chips.innerHTML=`<button type="button" class="cleaning-area-chip ${view.filter==='all'?'active':''}" onclick="setCleaningAreaFilter('all')">All (${items.length})</button>`+options.map(o=>`<button type="button" class="cleaning-area-chip ${view.filter===o.key?'active':''}" onclick="setCleaningAreaFilter('${escapeHtml(o.key)}')">${escapeHtml(o.name)} (${o.count})</button>`).join('');}
+  if(!items.length){if(summary)summary.textContent='';area.innerHTML='<div class="empty-state">No cleaning tasks are saved yet.</div>';return;}
+  const filtered=view.filter==='all'?items:items.filter(i=>cleaningAreaKey(cleaningAreaName(i))===view.filter);
+  if(summary){const label=view.filter==='all'?'all areas':(options.find(o=>o.key===view.filter)?.name||'selected area');summary.textContent=`Showing ${filtered.length} of ${items.length} cleaning task${items.length===1?'':'s'} · ${label}.`;}
+  if(!filtered.length){area.innerHTML='<div class="empty-state">No cleaning tasks are saved for this area.</div>';return;}
+  const sorted=[...filtered].sort((a,b)=>String(a.nextDue||'').localeCompare(String(b.nextDue||''))||cleaningAreaName(a).localeCompare(cleaningAreaName(b)));
+  if(view.group){
+    const groups=new Map();sorted.forEach(i=>{const n=cleaningAreaName(i);if(!groups.has(n))groups.set(n,[]);groups.get(n).push(i);});
+    [...groups.entries()].sort((a,b)=>a[0].localeCompare(b[0],undefined,{sensitivity:'base'})).forEach(([name,rows])=>{const section=document.createElement('section');section.className='cleaning-area-group';section.innerHTML=`<h3>${escapeHtml(name)} <span>${rows.length}</span></h3>`;rows.forEach(i=>section.appendChild(cleaningTaskRow(i)));area.appendChild(section);});
+  }else sorted.forEach(i=>area.appendChild(cleaningTaskRow(i)));
+}
+
+
+
+/* ===== Custom lists ===== */
+let activeCustomListId='';
+function openCustomListManager(listId=''){
+  activeCustomListId=String(listId||'');
+  const list=(data.customLists||[]).find(x=>String(x.id)===activeCustomListId);
+  const title=document.getElementById('customListDialogTitle');
+  const name=document.getElementById('customListName');
+  const item=document.getElementById('customListNewItem');
+  if(title)title.textContent=list?'Edit custom list':'Create custom list';
+  if(name)name.value=list?.name||'';
+  if(item)item.value='';
+  renderCustomListDialogItems();
+  document.getElementById('customListDialog')?.showModal();
+  setTimeout(()=>name?.focus(),60);
+}
+function closeCustomListManager(){document.getElementById('customListDialog')?.close();activeCustomListId='';}
+function saveCustomListName(closeAfter=true){
+  const name=document.getElementById('customListName')?.value.trim();
+  if(!name){alert('Please give the list a name.');return;}
+  let list=(data.customLists||[]).find(x=>String(x.id)===activeCustomListId);
+  if(!list){list={id:uid(),name,items:[]};data.customLists.unshift(list);activeCustomListId=list.id;}
+  else list.name=name;
+  saveData();renderCustomLists();updateListHubCounts();renderCustomListDialogItems();showSaved('Custom list saved');
+  if(closeAfter)closeCustomListManager();
+}
+
+function addCustomListItem(){
+  let list=(data.customLists||[]).find(x=>String(x.id)===activeCustomListId);
+  if(!list){saveCustomListName(false);list=(data.customLists||[]).find(x=>String(x.id)===activeCustomListId);}
+  if(!list)return;
+  const input=document.getElementById('customListNewItem');const name=input?.value.trim();if(!name)return;
+  list.items=list.items||[];list.items.push({id:uid(),name,completed:false});if(input)input.value='';saveData();renderCustomLists();updateListHubCounts();renderCustomListDialogItems();
+}
+function toggleCustomListItem(listId,itemId){const list=(data.customLists||[]).find(x=>String(x.id)===String(listId));const item=list?.items?.find(x=>String(x.id)===String(itemId));if(!item)return;item.completed=!item.completed;saveData();renderCustomLists();renderCustomListDialogItems();}
+function deleteCustomListItem(listId,itemId){const list=(data.customLists||[]).find(x=>String(x.id)===String(listId));if(!list)return;list.items=(list.items||[]).filter(x=>String(x.id)!==String(itemId));saveData();renderCustomLists();updateListHubCounts();renderCustomListDialogItems();}
+function deleteActiveCustomList(){deleteCustomList(activeCustomListId);}
+function deleteCustomList(listId){const list=(data.customLists||[]).find(x=>String(x.id)===String(listId));if(!list||!confirm(`Delete the list “${list.name}”?`))return;data.customLists=(data.customLists||[]).filter(x=>String(x.id)!==String(listId));saveData();closeCustomListManager();renderCustomLists();updateListHubCounts();}
+function renderCustomListDialogItems(){
+  const area=document.getElementById('customListDialogItems');if(!area)return;area.innerHTML='';
+  const list=(data.customLists||[]).find(x=>String(x.id)===activeCustomListId);
+  const del=document.getElementById('deleteCustomListButton');if(del)del.hidden=!list;
+  if(!list){area.innerHTML='<div class="empty-state">Save the list name, then add items.</div>';return;}
+  if(!(list.items||[]).length){area.innerHTML='<div class="empty-state">This list is empty.</div>';return;}
+  [...(list.items||[])].sort((a,b)=>Number(a.completed)-Number(b.completed)).forEach(item=>{const row=document.createElement('div');row.className=`compact-manage-row ${item.completed?'completed-row':''}`;row.innerHTML=`<button type="button" class="complete-dot" onclick="toggleCustomListItem('${list.id}','${item.id}')" aria-label="${item.completed?'Mark active':'Complete'}">${item.completed?'✓':''}</button><button type="button" class="compact-row-main" onclick="toggleCustomListItem('${list.id}','${item.id}')"><span class="compact-row-title">${escapeHtml(item.name)}</span></button><button type="button" class="small-button danger-text" onclick="deleteCustomListItem('${list.id}','${item.id}')">Delete</button>`;area.appendChild(row);});
+}
+function renderCustomLists(){
+  const area=document.getElementById('customListsArea');if(!area)return;area.innerHTML='';
+  const lists=data.customLists||[];
+  if(!lists.length){area.innerHTML='<div class="empty-state">No custom lists yet. Create one for shopping, packing, ideas or anything else.</div>';return;}
+  lists.forEach(list=>{const card=document.createElement('article');card.className='custom-list-card';card.innerHTML=`<div class="custom-list-heading"><div><h3>${escapeHtml(list.name||'Untitled list')}</h3></div><button type="button" class="small-button" onclick="openCustomListManager('${list.id}')">Manage</button></div><div class="stack-list">${[...(list.items||[])].sort((a,b)=>Number(a.completed)-Number(b.completed)).slice(0,5).map(item=>`<button type="button" class="custom-preview-item ${item.completed?'completed-row':''}" onclick="toggleCustomListItem('${list.id}','${item.id}')"><span>${item.completed?'✓':'○'}</span><span>${escapeHtml(item.name)}</span></button>`).join('')||'<div class="empty-state">This list is empty.</div>'}</div>`;area.appendChild(card);});
+}
+
+/* ===== Lists refresh ===== */
+function refreshListsImmediately() {
+  renderTodos();
+  renderAppointments();
+  renderInbox();
+  renderWaiting();
+  renderAnnualDates();
+  renderProjects();
+  renderCleaning();
+  renderCustomLists();
+  updateListHubCounts();
+}
+
+const originalRenderAllV15 = renderAll;
+renderAll = function() {
+  originalRenderAllV15();
+  refreshListsImmediately();
+};
+
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',initialiseListSearch);}else{initialiseListSearch();}
+
+
+/* ===== Version 50 recurring tasks ===== */
+function recurringDate(value){ return value ? new Date(`${value}T12:00:00`) : null; }
+function recurringDateKey(date){ return localDateKey(date); }
+function nthWeekdayOfMonth(year,month,weekday,ordinal){
+  const w=Number(weekday),o=Number(ordinal);
+  if(o===-1){const d=new Date(year,month+1,0,12);d.setDate(d.getDate()-((d.getDay()-w+7)%7));return d;}
+  const d=new Date(year,month,1,12);d.setDate(1+((w-d.getDay()+7)%7)+((o-1)*7));
+  return d.getMonth()===month?d:null;
+}
+function addRecurringInterval(date, unit, interval, task={}){
+  const next=new Date(date); const n=Math.max(1,Number(interval)||1);
+  if(unit==='day') next.setDate(next.getDate()+n);
+  else if(unit==='week') next.setDate(next.getDate()+(7*n));
+  else if(unit==='month' && task.monthlyMode==='nthWeekday'){
+    const targetMonth=next.getMonth()+n; const year=next.getFullYear()+Math.floor(targetMonth/12); const month=((targetMonth%12)+12)%12;
+    return nthWeekdayOfMonth(year,month,Number(task.weekday),Number(task.ordinal)) || new Date(year,month+1,0,12);
+  } else if(unit==='month') { const day=next.getDate(); next.setDate(1); next.setMonth(next.getMonth()+n); next.setDate(Math.min(day,new Date(next.getFullYear(),next.getMonth()+1,0).getDate())); }
+  else if(unit==='year') { const month=next.getMonth(),day=next.getDate(); next.setDate(1); next.setFullYear(next.getFullYear()+n); next.setMonth(month); next.setDate(Math.min(day,new Date(next.getFullYear(),month+1,0).getDate())); }
+  return next;
+}
+function recurringPatternLabel(task){
+  const n=Math.max(1,Number(task.interval)||1), unit=task.unit||'week';
+  if(unit==='month' && task.monthlyMode==='nthWeekday'){
+    const ord={1:'first',2:'second',3:'third',4:'fourth','-1':'last'}[String(task.ordinal)]||'first';
+    const day=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][Number(task.weekday)||0];
+    return n===1?`Monthly on the ${ord} ${day}`:`Every ${n} months on the ${ord} ${day}`;
+  }
+  if(n===1) return ({day:'Daily',week:'Weekly',month:'Monthly on the same date',year:'Yearly'})[unit]||'Repeating';
+  return `Every ${n} ${unit}s`;
+}
+function updateRecurringRuleControls(){
+  const unit=document.getElementById('recurringTaskUnit')?.value||'week';
+  const monthly=unit==='month';
+  const mode=document.getElementById('recurringMonthlyMode')?.value||'date';
+  const monthlyLabel=document.getElementById('recurringMonthlyModeLabel');
+  const ordinalLabel=document.getElementById('recurringOrdinalLabel');
+  const weekdayLabel=document.getElementById('recurringWeekdayLabel');
+  if(monthlyLabel) monthlyLabel.hidden=!monthly;
+  if(ordinalLabel) ordinalLabel.hidden=!monthly||mode!=='nthWeekday';
+  if(weekdayLabel) weekdayLabel.hidden=!monthly||mode!=='nthWeekday';
+
+  const interval=Math.max(1,Number(document.getElementById('recurringTaskInterval')?.value)||1);
+  const summary=document.getElementById('recurringRuleSummary');
+  if(summary){
+    let text='';
+    if(unit==='day') text=interval===1?'This task will repeat every day.':`This task will repeat every ${interval} days.`;
+    else if(unit==='week') text=interval===1?'This task will repeat every week.':`This task will repeat every ${interval} weeks.`;
+    else if(unit==='year') text=interval===1?'This task will repeat every year on the selected date.':`This task will repeat every ${interval} years on the selected date.`;
+    else if(mode==='nthWeekday'){
+      const ord={1:'first',2:'second',3:'third',4:'fourth','-1':'last'}[String(document.getElementById('recurringOrdinal')?.value||'1')];
+      const day=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][Number(document.getElementById('recurringWeekday')?.value||0)];
+      text=interval===1?`This task will repeat on the ${ord} ${day} of every month.`:`This task will repeat on the ${ord} ${day} every ${interval} months.`;
+    } else text=interval===1?'This task will repeat monthly on the same calendar date.':`This task will repeat every ${interval} months on the same calendar date.`;
+    summary.textContent=text;
+  }
+}
+function recurringStatus(task){
+  if(task.status==='paused') return {label:'Paused',className:'ongoing'};
+  const due=recurringDate(task.nextDue), today=recurringDate(localDateKey());
+  if(!due) return {label:'No due date',className:'ongoing'};
+  if(due<today) return {label:'Overdue',className:'overdue'};
+  if(due.getTime()===today.getTime()) return {label:'Due today',className:'due'};
+  return {label:formatDate(task.nextDue),className:'ongoing'};
+}
+function openRecurringTaskDialog(id=''){
+  const dialog=document.getElementById('recurringTaskDialog'); if(!dialog) return;
+  const task=(data.recurringTasks||[]).find(x=>x.id===id);
+  document.getElementById('recurringTaskId').value=task?.id||'';
+  document.getElementById('recurringTaskName').value=task?.name||'';
+  document.getElementById('recurringTaskNotes').value=task?.notes||'';
+  document.getElementById('recurringTaskDueDate').value=task?.nextDue||localDateKey();
+  document.getElementById('recurringTaskInterval').value=task?.interval||1;
+  document.getElementById('recurringTaskUnit').value=task?.unit||'week';
+  document.getElementById('recurringTaskStatus').value=task?.status||'active';
+  document.getElementById('recurringMonthlyMode').value=task?.monthlyMode||'date';
+  document.getElementById('recurringOrdinal').value=String(task?.ordinal??2);
+  document.getElementById('recurringWeekday').value=String(task?.weekday??4);
+  document.getElementById('recurringTaskTags').value=tagsInputValue(task);
+  updateRecurringRuleControls();
+  document.getElementById('recurringTaskDialogTitle').textContent=task?'Edit recurring task':'New recurring task';
+  dialog.showModal();
+}
+function closeRecurringTaskDialog(){ document.getElementById('recurringTaskDialog')?.close(); }
+function saveRecurringTask(event){
+  event.preventDefault();
+  const id=document.getElementById('recurringTaskId').value;
+  const existing=(data.recurringTasks||[]).find(x=>x.id===id);
+  const unit=document.getElementById('recurringTaskUnit').value, monthlyMode=unit==='month'?document.getElementById('recurringMonthlyMode').value:'date';
+  const task={id:id||uid(),name:document.getElementById('recurringTaskName').value.trim(),notes:document.getElementById('recurringTaskNotes').value.trim(),tags:normaliseTags(document.getElementById('recurringTaskTags')?.value),nextDue:document.getElementById('recurringTaskDueDate').value,interval:Math.max(1,Number(document.getElementById('recurringTaskInterval').value)||1),unit,monthlyMode,ordinal:monthlyMode==='nthWeekday'?Number(document.getElementById('recurringOrdinal').value):null,weekday:monthlyMode==='nthWeekday'?Number(document.getElementById('recurringWeekday').value):null,status:document.getElementById('recurringTaskStatus').value,createdAt:existing?.createdAt||new Date().toISOString(),lastCompleted:existing?.lastCompleted||''};
+  if(!task.name||!task.nextDue) return;
+  if(existing) Object.assign(existing,task); else data.recurringTasks.push(task);
+  saveData(); closeRecurringTaskDialog(); renderAll(); filterMyLists(document.getElementById('globalListSearch')?.value||'');
+}
+function completeRecurringTask(id){
+  const task=(data.recurringTasks||[]).find(x=>x.id===id); if(!task) return;
+  let next=recurringDate(task.nextDue)||recurringDate(localDateKey()); const today=recurringDate(localDateKey());
+  do { next=addRecurringInterval(next,task.unit,task.interval,task); } while(next<=today);
+  task.lastCompleted=new Date().toISOString(); task.nextDue=recurringDateKey(next); task.status='active';
+  saveData(); renderAll();
+}
+function toggleRecurringPause(id){ const task=data.recurringTasks.find(x=>x.id===id); if(!task)return; task.status=task.status==='paused'?'active':'paused'; saveData();renderAll(); }
+function deleteRecurringTask(id){ if(!confirm('Delete this recurring task?'))return; data.recurringTasks=data.recurringTasks.filter(x=>x.id!==id);saveData();renderAll(); }
+function recurringTaskCard(task){
+  const status=recurringStatus(task), row=document.createElement('div'); row.className='list-card recurring-task-card v10-row';
+  row.innerHTML=`<div class="card-top"><div><div class="card-title">${escapeHtml(task.name)}</div><div class="card-meta">${escapeHtml(recurringPatternLabel(task))} · Next due ${escapeHtml(formatDate(task.nextDue))}</div></div><span class="badge ${status.className}">${escapeHtml(status.label)}</span></div>${task.notes?`<div class="card-details">${escapeHtml(task.notes)}</div>`:''}${tagsMarkup(task)}<div class="card-actions"><button type="button" onclick="completeRecurringTask('${task.id}')" ${task.status==='paused'?'disabled':''}>Complete</button><button type="button" class="secondary-button" onclick="openRecurringTaskDialog('${task.id}')">Edit</button><button type="button" class="secondary-button" onclick="toggleRecurringPause('${task.id}')">${task.status==='paused'?'Resume':'Pause'}</button><button type="button" class="danger-button" onclick="deleteRecurringTask('${task.id}')">Delete</button></div>`;
+  return row;
+}
+function renderRecurringTasks(){
+  const area=document.getElementById('recurringTasksArea'); if(!area)return; area.innerHTML='';
+  const tasks=[...(data.recurringTasks||[])].sort((a,b)=>(a.status==='paused')-(b.status==='paused')||String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!tasks.length){area.innerHTML='<div class="empty-state">No recurring tasks yet. Add one for an obligation that must remain visible until completed.</div>';return;}
+  tasks.forEach(task=>area.appendChild(recurringTaskCard(task)));
+}
+function renderRecurringHome(){
+  const area=document.getElementById('homeRecurringArea'); if(!area)return; area.innerHTML='';
+  const today=recurringDate(localDateKey()); const tasks=(data.recurringTasks||[]).filter(t=>t.status!=='paused'&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!tasks.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  tasks.forEach(task=>{const st=recurringStatus(task);area.appendChild(compactReminderRow({id:task.id,name:task.name,dueDate:task.nextDue,itemType:'recurring'},{meta:`${recurringPatternLabel(task)} · ${st.label}`,badge:st.label,actionable:true,onComplete:()=>completeRecurringTask(task.id),clickable:false}));});
+}
+const renderAllV49=renderAll;
+renderAll=function(){ renderAllV49(); renderRecurringTasks(); renderRecurringHome(); };
+renderRecurringTasks(); renderRecurringHome(); initialiseListSearch();
+
+function applyTagBadgesToRenderedLists(){
+  const mappings=[
+    ['todoArea',data.todos],['projectsArea',data.projects],['appointmentsArea',data.appointments],['recurringTasksArea',data.recurringTasks],['inboxArea',data.inbox],['waitingArea',data.waiting],['annualArea',data.annualDates],['cleaningArea',data.cleaningTasks]
+  ];
+  mappings.forEach(([areaId,items])=>{
+    const area=document.getElementById(areaId);if(!area||!Array.isArray(items))return;
+    const rows=[...area.children].filter(el=>!el.classList.contains('empty-state'));
+    items.forEach(item=>{
+      const name=String(item?.name||item?.title||'').trim();if(!name)return;
+      const row=rows.find(el=>String(el.textContent||'').includes(name));
+      const html=tagsMarkup(item);if(row&&html&&!row.querySelector('.tag-row'))row.insertAdjacentHTML('beforeend',html);
+    });
+  });
+}
+const renderAllV51b=renderAll;
+renderAll=function(){renderAllV51b();applyTagBadgesToRenderedLists();};
+setTimeout(()=>{updateRecurringRuleControls();applyTagBadgesToRenderedLists();},0);
+
+
+/* ===== v51d corrected: ranked Lists search without duplicate Smart Lists ===== */
+function searchMatchScore(text,query){const q=normaliseSearchText(query);if(!q)return 0;const hay=normaliseSearchText(text);const tokens=q.split(/\s+/).filter(Boolean);if(!tokens.every(t=>hay.includes(t)))return -1;if(hay===q)return 100;if(hay.startsWith(q))return 80;if(hay.includes(` ${q} `)||hay.includes(q))return 60;return 40+tokens.reduce((s,t)=>s+(hay.startsWith(t)?4:1),0);}
+const filterMyListsV51b=filterMyLists;
+filterMyLists=function(query=''){
+ const q=normaliseSearchText(query??document.getElementById('globalListSearch')?.value??'');
+ filterMyListsV51b(query);
+ document.querySelectorAll('.managed-list-section').forEach(section=>{const rows=[...section.querySelectorAll(':scope > .stack-list > .compact-manage-row,:scope > .stack-list > .annual-manage-row,:scope > .stack-list > .list-card,:scope > .stack-list > .v10-row,:scope > .custom-lists-grid > .custom-list-card')];const parent=rows[0]?.parentElement;if(!parent)return;rows.forEach((row,i)=>{if(!row.dataset.originalSearchOrder)row.dataset.originalSearchOrder=String(i);row.dataset.searchScore=String(q?searchMatchScore(row.textContent||'',q):0);});rows.sort((a,b)=>q?Number(b.dataset.searchScore)-Number(a.dataset.searchScore):Number(a.dataset.originalSearchOrder)-Number(b.dataset.originalSearchOrder)).forEach(r=>parent.appendChild(r));});
+};
+
+
+/* ===== v51d Today workspace, timer and Convert workflow ===== */
+let focusTimerInterval=null, focusTimerRemaining=0, focusTimerItemId='', focusTimerPaused=false;
+function focusItemById(id){return (data.todayFocus||[]).find(x=>String(x.id)===String(id));}
+function ensureTodayFocusFields(){
+  data.todayFocus=Array.isArray(data.todayFocus)?data.todayFocus:[];
+  data.todayFocus.forEach((x,i)=>{if(typeof x.notes!=='string')x.notes='';if(!Number.isFinite(Number(x.estimatedMinutes)))x.estimatedMinutes=0;if(typeof x.pinned!=='boolean')x.pinned=false;if(!Number.isFinite(Number(x.order)))x.order=i;});
+}
+function openTodayFocusEdit(id){
+  const item=focusItemById(id);if(!item)return;
+  document.getElementById('todayFocusEditId').value=item.id;
+  document.getElementById('todayFocusEditName').value=item.name||'';
+  document.getElementById('todayFocusEditNotes').value=item.notes||'';
+  document.getElementById('todayFocusEditMinutes').value=item.estimatedMinutes||'';
+  document.getElementById('todayFocusEditPinned').checked=Boolean(item.pinned);
+  document.getElementById('todayFocusEditDialog').showModal();
+  setTimeout(()=>document.getElementById('todayFocusEditName').focus(),30);
+}
+function closeTodayFocusEdit(){document.getElementById('todayFocusEditDialog')?.close();}
+function saveTodayFocusEdit(event){
+  event.preventDefault();const item=focusItemById(document.getElementById('todayFocusEditId').value);if(!item)return;
+  item.name=document.getElementById('todayFocusEditName').value.trim();
+  item.notes=document.getElementById('todayFocusEditNotes').value.trim();
+  item.estimatedMinutes=Math.max(0,Number(document.getElementById('todayFocusEditMinutes').value||0));
+  item.pinned=document.getElementById('todayFocusEditPinned').checked;
+  saveData();closeTodayFocusEdit();renderTodayFocus();showSaved('Focus item saved');
+}
+function moveTodayFocusItem(id,direction){
+  ensureTodayFocusFields();const active=(data.todayFocus||[]).filter(x=>!x.completed).sort((a,b)=>Number(b.pinned)-Number(a.pinned)||Number(a.order)-Number(b.order));
+  const index=active.findIndex(x=>String(x.id)===String(id));const target=index+direction;if(index<0||target<0||target>=active.length)return;
+  const a=active[index],b=active[target],temp=Number(a.order);a.order=Number(b.order);b.order=temp;saveData();renderTodayFocus();
+}
+function toggleTodayFocusPin(id){const item=focusItemById(id);if(!item)return;item.pinned=!item.pinned;saveData();renderTodayFocus();}
+function openFocusTimer(id){
+  const item=focusItemById(id);if(!item)return;focusTimerItemId=String(id);focusTimerRemaining=(Number(item.estimatedMinutes)||15)*60;focusTimerPaused=false;
+  document.getElementById('focusTimerTitle').textContent=item.name;
+  document.getElementById('focusTimerChoices').classList.remove('hidden');document.getElementById('focusTimerRunningActions').classList.add('hidden');
+  document.getElementById('focusTimerMessage').textContent=item.estimatedMinutes?`Suggested time: ${item.estimatedMinutes} minutes.`:'Choose a focus time.';
+  updateFocusTimerDisplay();document.getElementById('focusTimerDialog').showModal();
+}
+function updateFocusTimerDisplay(){const m=Math.floor(focusTimerRemaining/60),s=focusTimerRemaining%60;const el=document.getElementById('focusTimerDisplay');if(el)el.textContent=`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;}
+function startFocusTimer(minutes){clearInterval(focusTimerInterval);focusTimerRemaining=minutes*60;focusTimerPaused=false;document.getElementById('focusTimerChoices').classList.add('hidden');document.getElementById('focusTimerRunningActions').classList.remove('hidden');document.getElementById('focusTimerPauseButton').textContent='Pause';document.getElementById('focusTimerMessage').textContent='Stay with this one task until the timer ends.';updateFocusTimerDisplay();focusTimerInterval=setInterval(()=>{if(focusTimerPaused)return;focusTimerRemaining=Math.max(0,focusTimerRemaining-1);updateFocusTimerDisplay();if(focusTimerRemaining===0){clearInterval(focusTimerInterval);document.getElementById('focusTimerMessage').textContent='Time is up. Mark it complete or choose another period.';document.getElementById('focusTimerChoices').classList.remove('hidden');}},1000);}
+function pauseResumeFocusTimer(){focusTimerPaused=!focusTimerPaused;document.getElementById('focusTimerPauseButton').textContent=focusTimerPaused?'Continue':'Pause';}
+function closeFocusTimer(){clearInterval(focusTimerInterval);focusTimerInterval=null;document.getElementById('focusTimerDialog')?.close();}
+function completeFocusFromTimer(){const item=focusItemById(focusTimerItemId);if(item&&!item.completed)toggleTodayFocusItem(item.id);closeFocusTimer();}
+function convertTodayFocus(id,type){
+  const item=focusItemById(id);if(!item)return;
+  const name=item.name||'',details=item.notes||'';
+  if(type==='todo'||type==='project'||type==='cleaning'){
+    openAddDialog(type);document.getElementById('itemName').value=name;document.getElementById('itemDetails').value=details;
+    if(type==='cleaning'){document.getElementById('cleaningFrequency').value='monthly';document.getElementById('cleaningStartDate').value=localDateKey();document.getElementById('cleaningFrequency').dispatchEvent(new Event('change',{bubbles:true}));}
+  }else if(type==='recurring'){
+    openRecurringTaskDialog();document.getElementById('recurringTaskName').value=name;document.getElementById('recurringTaskNotes').value=details;document.getElementById('recurringTaskUnit').value='month';document.getElementById('recurringTaskInterval').value=1;updateRecurringRuleControls();
+  }else if(type==='appointment')openAppointmentDialog('',name,details);
+  else if(type==='waiting'){
+    data.waiting.unshift({id:uid(),name,details,status:'waiting',createdAt:new Date().toISOString()});saveData();renderAll();deleteTodayFocusItem(id);showSaved('Moved to Pending note');return;
+  }
+  item.conversionPending=type;saveData();
+  alert('The new item is pre-filled. Save it, then remove the original Focus item when you are happy it is in the right place.');
+}
+function todayFocusConvertMenu(id){return `<div class="convert-menu-label">Convert to…</div><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','todo')">To-do</button><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','cleaning')">Cleaning task</button><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','recurring')">Recurring task</button><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','appointment')">Appointment</button><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','project')">Project</button><button onclick="closeAnchoredMenu();convertTodayFocus('${id}','waiting')">Pending note</button>`;}
+renderTodayFocus=function(){
+  ensureTodayFocusFields();const area=document.getElementById('todayFocusArea');if(!area)return;area.innerHTML='';
+  const items=[...(data.todayFocus||[])].sort((a,b)=>Number(a.completed)-Number(b.completed)||Number(b.pinned)-Number(a.pinned)||Number(a.order)-Number(b.order)||String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
+  if(!items.length){area.innerHTML='<div class="empty-state">Your Focus is clear. Add a practical job when you are ready.</div>';return;}
+  items.forEach(item=>{
+    const row=document.createElement('div');row.className=`v10-row today-focus-row ${item.completed?'completed-row':''} ${item.pinned?'pinned-focus-row':''}`;
+    const meta=[item.completed?'Completed':'Today',item.estimatedMinutes?`${item.estimatedMinutes} min`:'',item.notes?item.notes:''].filter(Boolean).join(' · ');
+    const actions=`<button onclick="closeAnchoredMenu();openTodayFocusEdit('${item.id}')">Edit details</button><button onclick="closeAnchoredMenu();openFocusTimer('${item.id}')">Start timer</button><button onclick="closeAnchoredMenu();toggleTodayFocusPin('${item.id}')">${item.pinned?'Unpin':'Pin to top'}</button><button onclick="closeAnchoredMenu();moveTodayFocusItem('${item.id}','top')">Move to top</button><button onclick="moveTodayFocusItemKeepMenu('${item.id}',-1,this)">Move up</button><button onclick="moveTodayFocusItemKeepMenu('${item.id}',1,this)">Move down</button><button onclick="closeAnchoredMenu();moveTodayFocusItem('${item.id}','bottom')">Move to bottom</button>${todayFocusConvertMenu(item.id)}<button onclick="closeAnchoredMenu();toggleTodayFocusItem('${item.id}')">${item.completed?'Reinstate':'Complete'}</button><button class="danger-text" onclick="closeAnchoredMenu();deleteTodayFocusItem('${item.id}')">Delete</button>`;
+    row.innerHTML=`<button type="button" class="complete-dot" onclick="toggleTodayFocusItem('${item.id}')" aria-label="${item.completed?'Reinstate':'Complete'} ${escapeHtml(item.name)}">${item.completed?'✓':''}</button><button type="button" class="v10-row-main" onclick="openTodayFocusEdit('${item.id}')"><span class="v10-row-title">${item.pinned?'★ ':''}${escapeHtml(item.name)}</span><span class="v10-row-meta">${escapeHtml(meta)}</span></button>${!item.completed?`<button type="button" class="focus-start-button" onclick="openFocusTimer('${item.id}')" aria-label="Start timer for ${escapeHtml(item.name)}">▶</button>`:''}${compactMenu(actions,item.name)}`;
+    area.appendChild(row);
+  });
+  if(items.some(x=>x.completed))area.insertAdjacentHTML('beforeend','<button type="button" class="small-button secondary-button clear-focus-completed" onclick="clearCompletedTodayFocus()">Remove completed items</button>');
+};
+ensureTodayFocusFields();saveData();renderTodayFocus();
+
+
+/* ===== v51d corrected acceptance fixes ===== */
+const FOCUS_TIMER_STORAGE_KEY='lifePlannerFocusTimer';
+let focusTimerEndAt=0;
+function currentFocusEditId(){return document.getElementById('todayFocusEditId')?.value||'';}
+function normaliseActiveFocusOrder(){
+  ensureTodayFocusFields();
+  const active=(data.todayFocus||[]).filter(x=>!x.completed).sort((a,b)=>Number(b.pinned)-Number(a.pinned)||Number(a.order)-Number(b.order));
+  active.forEach((x,i)=>x.order=i);
+  return active;
+}
+function moveEditedFocusItem(direction){
+  const id=currentFocusEditId();if(!id)return;
+  const active=normaliseActiveFocusOrder();
+  const index=active.findIndex(x=>String(x.id)===String(id));if(index<0)return;
+  let target=index;
+  if(direction==='top')target=0;else if(direction==='bottom')target=active.length-1;else target=Math.max(0,Math.min(active.length-1,index+Number(direction||0)));
+  if(target===index)return;
+  const [item]=active.splice(index,1);active.splice(target,0,item);active.forEach((x,i)=>x.order=i);
+  saveData();renderTodayFocus();showSaved(target===0?'Moved to top':target===active.length-1?'Moved to bottom':'Order updated');
+}
+function moveTodayFocusItem(id,direction){
+  ensureTodayFocusFields();const active=normaliseActiveFocusOrder();
+  const index=active.findIndex(x=>String(x.id)===String(id));if(index<0)return;
+  let target=direction==='top'?0:direction==='bottom'?active.length-1:Math.max(0,Math.min(active.length-1,index+Number(direction||0)));
+  if(target===index)return;const [item]=active.splice(index,1);active.splice(target,0,item);active.forEach((x,i)=>x.order=i);saveData();renderTodayFocus();
+}
+function timerState(){return {itemId:focusTimerItemId,remaining:focusTimerRemaining,paused:focusTimerPaused,endAt:focusTimerEndAt,title:focusItemById(focusTimerItemId)?.name||document.getElementById('focusTimerTitle')?.textContent||'Focus timer',active:focusTimerRemaining>0||focusTimerEndAt>0};}
+function saveFocusTimerState(){try{localStorage.setItem(FOCUS_TIMER_STORAGE_KEY,JSON.stringify(timerState()));}catch(e){}}
+function clearFocusTimerState(){try{localStorage.removeItem(FOCUS_TIMER_STORAGE_KEY);}catch(e){}}
+function recalculateFocusTimer(){if(!focusTimerPaused&&focusTimerEndAt)focusTimerRemaining=Math.max(0,Math.ceil((focusTimerEndAt-Date.now())/1000));}
+function updateFocusTimerDisplay(){
+  recalculateFocusTimer();const m=Math.floor(focusTimerRemaining/60),s=focusTimerRemaining%60,text=`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  const el=document.getElementById('focusTimerDisplay');if(el)el.textContent=text;
+  const mini=document.getElementById('focusTimerMiniDisplay');if(mini)mini.textContent=text;
+  const title=focusItemById(focusTimerItemId)?.name||document.getElementById('focusTimerTitle')?.textContent||'Focus timer';
+  const mt=document.getElementById('focusTimerMiniTitle');if(mt)mt.textContent=title;
+  const pb=document.getElementById('focusTimerPauseButton');if(pb)pb.textContent=focusTimerPaused?'Continue':'Pause';
+  const mp=document.getElementById('focusTimerMiniPause');if(mp)mp.textContent=focusTimerPaused?'Continue':'Pause';
+  if(focusTimerRemaining<=0&&focusTimerEndAt){focusTimerEndAt=0;clearInterval(focusTimerInterval);focusTimerInterval=null;const msg=document.getElementById('focusTimerMessage');if(msg)msg.textContent='Time is up. Mark it complete or choose another period.';document.getElementById('focusTimerChoices')?.classList.remove('hidden');saveFocusTimerState();}
+}
+function ensureFocusTimerInterval(){clearInterval(focusTimerInterval);focusTimerInterval=setInterval(()=>{updateFocusTimerDisplay();saveFocusTimerState();},1000);}
+function startFocusTimer(minutes){
+  focusTimerRemaining=Math.max(1,Number(minutes)||15)*60;focusTimerPaused=false;focusTimerEndAt=Date.now()+focusTimerRemaining*1000;
+  document.getElementById('focusTimerChoices')?.classList.add('hidden');document.getElementById('focusTimerRunningActions')?.classList.remove('hidden');
+  const msg=document.getElementById('focusTimerMessage');if(msg)msg.textContent='Stay with this one task until the timer ends.';
+  ensureFocusTimerInterval();updateFocusTimerDisplay();saveFocusTimerState();
+}
+function pauseResumeFocusTimer(){
+  recalculateFocusTimer();focusTimerPaused=!focusTimerPaused;focusTimerEndAt=focusTimerPaused?0:Date.now()+focusTimerRemaining*1000;
+  if(!focusTimerPaused)ensureFocusTimerInterval();updateFocusTimerDisplay();saveFocusTimerState();
+}
+function minimiseFocusTimer(){
+  document.getElementById('focusTimerDialog')?.close();
+  if(focusTimerRemaining>0||focusTimerEndAt){
+    document.getElementById('focusTimerMini')?.classList.remove('hidden');
+    document.body.classList.add('timer-minimised');
+  }
+  saveFocusTimerState();
+}
+function restoreFocusTimerDialog(){
+  document.getElementById('focusTimerMini')?.classList.add('hidden');
+  document.body.classList.remove('timer-minimised');const item=focusItemById(focusTimerItemId);if(item)document.getElementById('focusTimerTitle').textContent=item.name;setFocusTimerCompletionVisibility();
+  document.getElementById('focusTimerChoices')?.classList.toggle('hidden',focusTimerRemaining>0||focusTimerEndAt>0);
+  document.getElementById('focusTimerRunningActions')?.classList.toggle('hidden',!(focusTimerRemaining>0||focusTimerEndAt>0));updateFocusTimerDisplay();document.getElementById('focusTimerDialog')?.showModal();
+}
+function closeFocusTimer(){minimiseFocusTimer();}
+function cancelFocusTimer(){clearInterval(focusTimerInterval);focusTimerInterval=null;focusTimerRemaining=0;focusTimerEndAt=0;focusTimerPaused=false;focusTimerItemId='';clearFocusTimerState();document.getElementById('focusTimerDialog')?.close();document.getElementById('focusTimerMini')?.classList.add('hidden');document.body.classList.remove('timer-minimised');updateFocusTimerDisplay();}
+function completeFocusFromTimer(){const item=focusItemById(focusTimerItemId);if(item&&!item.completed)toggleTodayFocusItem(item.id);cancelFocusTimer();}
+function setFocusTimerCompletionVisibility(){
+  const button=document.getElementById('focusTimerCompleteButton');
+  if(button)button.classList.toggle('hidden',!focusItemById(focusTimerItemId));
+}
+function openGlobalTimer(){
+  if(focusTimerRemaining>0||focusTimerEndAt){restoreFocusTimerDialog();return;}
+  focusTimerItemId='';focusTimerRemaining=15*60;focusTimerEndAt=0;focusTimerPaused=false;
+  const title=document.getElementById('focusTimerTitle');if(title)title.textContent='Timer';
+  document.getElementById('focusTimerChoices')?.classList.remove('hidden');
+  document.getElementById('focusTimerRunningActions')?.classList.add('hidden');
+  const message=document.getElementById('focusTimerMessage');if(message)message.textContent='Choose a time.';
+  setFocusTimerCompletionVisibility();updateFocusTimerDisplay();document.getElementById('focusTimerDialog')?.showModal();
+}
+function openFocusTimer(id){
+  const item=focusItemById(id);if(!item)return;
+  if(focusTimerItemId&&focusTimerItemId!==String(id)&&(focusTimerRemaining>0||focusTimerEndAt)){if(!confirm('Replace the timer that is already running?'))return;cancelFocusTimer();}
+  focusTimerItemId=String(id);focusTimerRemaining=(Number(item.estimatedMinutes)||15)*60;focusTimerEndAt=0;focusTimerPaused=false;
+  document.getElementById('focusTimerTitle').textContent=item.name;setFocusTimerCompletionVisibility();document.getElementById('focusTimerChoices')?.classList.remove('hidden');document.getElementById('focusTimerRunningActions')?.classList.add('hidden');
+  document.getElementById('focusTimerMessage').textContent=item.estimatedMinutes?`Suggested time: ${item.estimatedMinutes} minutes.`:'Choose a focus time.';updateFocusTimerDisplay();document.getElementById('focusTimerDialog')?.showModal();
+}
+function restoreStoredFocusTimer(){
+  try{const state=JSON.parse(localStorage.getItem(FOCUS_TIMER_STORAGE_KEY)||'null');if(!state||!state.active)return;focusTimerItemId=String(state.itemId||'');focusTimerRemaining=Math.max(0,Number(state.remaining)||0);focusTimerPaused=Boolean(state.paused);focusTimerEndAt=focusTimerPaused?0:Number(state.endAt)||0;if(!focusItemById(focusTimerItemId)){const title=document.getElementById('focusTimerTitle');if(title)title.textContent=state.title||'Timer';}setFocusTimerCompletionVisibility();recalculateFocusTimer();if(focusTimerRemaining>0){ensureFocusTimerInterval();document.getElementById('focusTimerMini')?.classList.remove('hidden');updateFocusTimerDisplay();}else clearFocusTimerState();}catch(e){clearFocusTimerState();}
+}
+function openWaitingForList(){showView('tasks');setTimeout(()=>jumpToList('waitingListSection'),30);}
+function renderWaitingHome(){
+  const area=document.getElementById('homeWaitingArea');if(!area)return;area.innerHTML='';
+  const items=(data.waiting||[]).filter(x=>!x.completed).sort((a,b)=>String(a.reviewDate||'9999-12-31').localeCompare(String(b.reviewDate||'9999-12-31'))).slice(0,5);
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing currently waiting for attention.</div>';return;}
+  items.forEach(x=>area.appendChild(makeV10Row({name:x.name,meta:x.reviewDate?`Review ${formatDate(x.reviewDate)}`:(x.note||x.details||'No review date'),dueDate:x.reviewDate,open:()=>editCapture('waiting',x.id)},{menu:compactMenu(`<button onclick="closeAnchoredMenu();editCapture('waiting','${x.id}')">Edit</button><button onclick="closeAnchoredMenu();completeWaiting('${x.id}')">Complete</button>`,x.name)})));
+}
+// Correct cleaning completion: advance from today when overdue and refresh Timeline immediately.
+function completeCleaning(id){
+  const task=(data.cleaningTasks||[]).find(item=>String(item.id)===String(id));if(!task)return;
+  const completedOn=localDateKey();task.lastCompleted=completedOn;
+  const anchor=(!task.nextDue||task.nextDue<completedOn)?completedOn:task.nextDue;
+  task.nextDue=nextCleaningDate(anchor,task.frequency||'weekly');saveData();renderAll();renderTimeline();refreshListsImmediately();
+}
+const renderAllV51dCorrected=renderAll;
+renderAll=function(){renderAllV51dCorrected();renderWaitingHome();};
+// Add faster actions to the Focus menu.
+const renderTodayFocusV51dCorrected=renderTodayFocus;
+renderTodayFocus=function(){renderTodayFocusV51dCorrected();document.querySelectorAll('#todayFocusArea .item-menu-popover').forEach(()=>{});};
+window.addEventListener('pageshow',()=>{restoreStoredFocusTimer();renderWaitingHome();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateFocusTimerDisplay();renderWaitingHome();}});
+setTimeout(()=>{restoreStoredFocusTimer();renderWaitingHome();},0);
+
+
+/* ===== v51d final acceptance corrections ===== */
+function moveTodayFocusItemKeepMenu(id,direction,button){
+  const menu=button?.closest('.anchored-item-menu');
+  const rect=menu?.getBoundingClientRect();
+  moveTodayFocusItem(id,direction);
+  // Reopen the same item menu after rendering so repeated moves are quick.
+  setTimeout(()=>{
+    const row=[...document.querySelectorAll('#todayFocusArea .today-focus-row')].find(r=>r.querySelector(`[onclick*="${id}"]`));
+    const trigger=row?.querySelector('.item-menu-trigger');
+    if(trigger){trigger.click();const reopened=document.querySelector('.anchored-item-menu');if(reopened&&rect){reopened.style.top=`${Math.max(8,rect.top)}px`;reopened.style.left=`${Math.max(8,rect.left)}px`;}}
+  },0);
+}
+
+// Keep the mini timer completely hidden until a running timer is deliberately minimised.
+function restoreStoredFocusTimer(){
+  const mini=document.getElementById('focusTimerMini');
+  mini?.classList.add('hidden');
+  document.body.classList.remove('timer-minimised');
+  try{
+    const state=JSON.parse(localStorage.getItem(FOCUS_TIMER_STORAGE_KEY)||'null');
+    if(!state||!state.active)return;
+    focusTimerItemId=String(state.itemId||'');focusTimerRemaining=Math.max(0,Number(state.remaining)||0);focusTimerPaused=Boolean(state.paused);focusTimerEndAt=focusTimerPaused?0:Number(state.endAt)||0;
+    recalculateFocusTimer();
+    if(focusTimerRemaining>0){ensureFocusTimerInterval();updateFocusTimerDisplay();}
+    else clearFocusTimerState();
+  }catch(e){clearFocusTimerState();}
+}
+
+function renderHomeEveningRoutine(){
+  const area=document.getElementById('homeEveningChecklist');
+  if(!area)return;
+  renderChecklist('homeEveningChecklist',data.eveningTasks,'daily',false);
+}
+
+// Cleaning completion must refresh Needs Attention after its next date advances.
+function completeCleaning(id){
+  const task=(data.cleaningTasks||[]).find(item=>String(item.id)===String(id));if(!task)return;
+  const completedOn=localDateKey();task.lastCompleted=completedOn;
+  const anchor=(!task.nextDue||task.nextDue<completedOn)?completedOn:task.nextDue;
+  task.nextDue=nextCleaningDate(anchor,task.frequency||'weekly');
+  saveData();renderAll();renderFocusToday();renderTimeline();refreshListsImmediately();
+}
+
+const renderAllV51dFinal=renderAll;
+renderAll=function(){renderAllV51dFinal();renderWaitingHome();renderHomeEveningRoutine();};
+window.addEventListener('pageshow',()=>{document.getElementById('focusTimerMini')?.classList.add('hidden');renderHomeEveningRoutine();});
+setTimeout(()=>{document.getElementById('focusTimerMini')?.classList.add('hidden');renderHomeEveningRoutine();},0);
+
+
+// v51e Quick Add
+const QUICK_ADD_LAST_KEY='myLifePlannerLastQuickAdd';
+function openQuickAdd(){
+  const dialog=document.getElementById('quickAddDialog');
+  if(!dialog)return;
+  const last=localStorage.getItem(QUICK_ADD_LAST_KEY)||'focus';
+  document.querySelectorAll('[data-quick-add]').forEach(button=>button.classList.toggle('last-used',button.dataset.quickAdd===last));
+  if(!dialog.open)dialog.showModal();
+}
+function closeQuickAdd(){document.getElementById('quickAddDialog')?.close();}
+function chooseQuickAdd(type){
+  localStorage.setItem(QUICK_ADD_LAST_KEY,type);
+  closeQuickAdd();
+  window.setTimeout(()=>{
+    if(type==='focus'){
+      showAppView('home');
+      const panel=document.getElementById('todayFocusPanel');
+      panel?.scrollIntoView({behavior:'smooth',block:'start'});
+      window.setTimeout(()=>document.getElementById('todayFocusInput')?.focus(),250);
+    }else if(type==='todo')openAddDialog('todo');
+    else if(type==='appointment')openAppointmentDialog();
+    else if(type==='recurring')openRecurringTaskDialog();
+    else if(type==='project')openAddDialog('project');
+    else if(type==='cleaning')openCleaningDialog();
+    else if(type==='waiting')openCaptureDialog('waiting');
+    else if(type==='annual')openAnnualDialog();
+    else if(type==='inbox')openCaptureDialog('inbox');
+  },50);
+}
+document.addEventListener('keydown',event=>{
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();openQuickAdd();}
+});
+
+/* ===== v51e iPhone timer/Quick Add final layout patch ===== */
+function syncQuickAddTimerClearance(){
+  const mini=document.getElementById('focusTimerMini');
+  const visible=Boolean(mini && !mini.classList.contains('hidden') && document.body.classList.contains('timer-minimised'));
+  if(!visible){
+    document.documentElement.style.removeProperty('--focus-timer-mini-height');
+    return;
+  }
+  requestAnimationFrame(()=>{
+    const height=Math.ceil(mini.getBoundingClientRect().height||78);
+    document.documentElement.style.setProperty('--focus-timer-mini-height',`${height}px`);
+  });
+}
+const minimiseFocusTimerV51eIphone=minimiseFocusTimer;
+minimiseFocusTimer=function(){minimiseFocusTimerV51eIphone();syncQuickAddTimerClearance();};
+const restoreFocusTimerDialogV51eIphone=restoreFocusTimerDialog;
+restoreFocusTimerDialog=function(){restoreFocusTimerDialogV51eIphone();syncQuickAddTimerClearance();};
+const cancelFocusTimerV51eIphone=cancelFocusTimer;
+cancelFocusTimer=function(){cancelFocusTimerV51eIphone();syncQuickAddTimerClearance();};
+const completeFocusFromTimerV51eIphone=completeFocusFromTimer;
+completeFocusFromTimer=function(){completeFocusFromTimerV51eIphone();syncQuickAddTimerClearance();};
+window.addEventListener('resize',syncQuickAddTimerClearance);
+window.addEventListener('orientationchange',()=>setTimeout(syncQuickAddTimerClearance,150));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(syncQuickAddTimerClearance,0);});
+
+
+/* ===== v51 Planner Health and Home optimisation ===== */
+const PLANNER_HEALTH_MEMORY_KEY='myLifePlannerHealthMemory';
+function healthMemory(){try{return JSON.parse(localStorage.getItem(PLANNER_HEALTH_MEMORY_KEY)||'{}')||{};}catch(e){return {};}}
+function saveHealthMemory(memory){localStorage.setItem(PLANNER_HEALTH_MEMORY_KEY,JSON.stringify(memory));}
+function healthHidden(key){const entry=healthMemory()[key];if(!entry)return false;if(entry.dismissed)return true;return Number(entry.snoozeUntil||0)>Date.now();}
+function rememberHealth(key,mode){const memory=healthMemory();memory[key]=mode==='dismiss'?{dismissed:true}:{snoozeUntil:Date.now()+7*86400000};saveHealthMemory(memory);renderPlannerHealth();}
+function ageInDays(value){if(!value)return null;const date=new Date(value);if(Number.isNaN(date.getTime()))return null;return Math.floor((Date.now()-date.getTime())/86400000);}
+function plannerHealthSuggestions(){
+ const suggestions=[];
+ (data.projects||[]).filter(x=>!x.completed).forEach(x=>{const age=ageInDays(x.updatedAt||x.createdAt);if(age!==null&&age>=7){suggestions.push({key:`project:${x.id}`,severity:Math.min(3,1+Math.floor(age/14)),title:'Project needs a look',copy:`${x.name||'A project'} has not been updated for ${age} days.`,open:()=>{showAppView('home');setTimeout(()=>{document.getElementById('homeProjectsPanel')?.scrollIntoView({behavior:'smooth',block:'start'});editProject(x.id);},120);}});}});
+ (data.inbox||[]).filter(x=>x.status!=='processed').forEach(x=>{const age=ageInDays(x.updatedAt||x.createdAt);if(age!==null&&age>=7)suggestions.push({key:`inbox:${x.id}`,severity:1,title:'Brain Inbox item waiting',copy:`${x.name||'An inbox item'} has been waiting for ${age} days.`,open:()=>{showAppView('tasks');setTimeout(()=>editCapture('inbox',x.id),100);}});});
+ (data.waiting||[]).filter(x=>!x.completed).forEach(x=>{const age=ageInDays(x.updatedAt||x.createdAt);if(age!==null&&age>=10)suggestions.push({key:`waiting:${x.id}`,severity:2,title:'Pending follow-up',copy:`${x.name||'A pending note'} has been pending for ${age} days.`,open:()=>{showAppView('tasks');setTimeout(()=>editCapture('waiting',x.id),100);}});});
+ (data.cleaningTasks||[]).filter(x=>!x.completed&&x.nextDue&&x.nextDue<localDateKey()).forEach(x=>{const days=Math.abs(daysBetween(new Date(),dateOnly(x.nextDue)));suggestions.push({key:`clean:${x.id}`,severity:2,title:'Cleaning task overdue',copy:`${x.name||'A cleaning task'} is overdue${days?` by ${days} day${days===1?'':'s'}`:''}.`,open:()=>editCleaning(x.id)});});
+ return suggestions.filter(x=>!healthHidden(x.key)).sort((a,b)=>b.severity-a.severity);
+}
+function renderPlannerHealth(){
+ const area=document.getElementById('plannerHealthArea');if(!area)return;
+ const all=plannerHealthSuggestions();
+ const overdueCount=(data.todos||[]).filter(x=>!x.completed&&x.dueDate&&x.dueDate<localDateKey()).length+(data.recurringTasks||[]).filter(x=>x.status!=='paused'&&x.nextDue&&x.nextDue<localDateKey()).length+(data.cleaningTasks||[]).filter(x=>!x.completed&&x.nextDue&&x.nextDue<localDateKey()).length;
+ const status=overdueCount>=4||all.some(x=>x.severity>=3)?['attention','🟠 Needs attention']:overdueCount||all.length?['good','🟡 Good']:['excellent','🟢 Excellent'];
+ if(!all.length){area.innerHTML=`<div class="planner-health-card"><div class="planner-health-top"><span class="health-status ${status[0]}">${status[1]}</span></div><div class="planner-health-empty">Nothing needs a special nudge right now.</div></div>`;return;}
+ const item=all[0];area.innerHTML=`<div class="planner-health-card"><div class="planner-health-top"><span class="health-status ${status[0]}">${status[1]}</span><span class="badge">1 suggestion</span></div><div class="planner-suggestion-title">${escapeHtml(item.title)}</div><div class="planner-suggestion-copy">${escapeHtml(item.copy)}</div><div class="planner-suggestion-actions"><button type="button" id="healthOpenButton">Open</button><button type="button" class="secondary-button" onclick="rememberHealth('${item.key}','snooze')">Snooze 7 days</button><button type="button" class="secondary-button" onclick="rememberHealth('${item.key}','dismiss')">Dismiss</button></div></div>`;
+ document.getElementById('healthOpenButton').onclick=item.open;
+}
+function setupHomeInfoButtons(){
+ const help={todayFocus:'Quick one-off jobs and intentions for today. Unfinished items stay until you deal with them.',needsAttention:'Dated and important items that need attention now.',timeSensitive:'Appointments and other fixed-time commitments for today.',thisWeek:'A brief look at what is coming up this week.',projects:'Active projects and their next steps.',waitingFor:'Things other people or circumstances need to move forward.',brainInbox:'Capture first and organise later.',recurringTasks:'Repeating responsibilities that remain visible until completed.',dailyRhythm:'Your editable everyday routine.',eveningRoutine:'Your editable end-of-day routine.',plannerHealth:'One considerate suggestion at a time. Snoozed or dismissed suggestions will not keep nagging.'};
+ document.querySelectorAll('.home-collapsible').forEach(panel=>{
+   const key=panel.dataset.homeSection,heading=panel.querySelector('.section-heading>div,.focus-heading>div');if(!key||!heading||heading.dataset.infoReady)return;
+   heading.dataset.infoReady='1';const h2=heading.querySelector('h2');if(!h2)return;
+   const explanation=[...heading.querySelectorAll('p')].find(p=>!p.classList.contains('eyebrow'));
+   if(explanation)explanation.remove();
+   const line=document.createElement('div');line.className='section-title-line';h2.parentNode.insertBefore(line,h2);line.appendChild(h2);
+   const button=document.createElement('button');button.type='button';button.className='section-info-button';button.textContent='i';button.setAttribute('aria-label',`About ${h2.textContent}`);line.appendChild(button);
+   const text=document.createElement('p');text.className='section-help-text hidden';text.textContent=help[key]||'More information about this section.';line.parentNode.insertBefore(text,line.nextSibling);
+   button.onclick=e=>{e.stopPropagation();text.classList.toggle('hidden');};
+ });
+}
+function optimiseHomeOrder(){
+ const quick=document.querySelector('.home-quick-actions');if(!quick||quick.dataset.orderReady)return;quick.dataset.orderReady='1';const parent=quick.parentNode;
+ const ids=['homeTodayPanel','needsAttentionPanel','todayFocusPanel','plannerHealthPanel','homeProjectsPanel','homeWaitingPanel','homeBrainInboxPanel','homeRecurringPanel','homeDailyRhythmPanel','homeEveningPanel'];
+ let anchor=quick;
+ ids.forEach(id=>{const el=document.getElementById(id);if(!el)return;const node=el.closest('.dashboard-grid')&&id==='homeTodayPanel'?el.closest('.dashboard-grid'):el;if(node===anchor)return;parent.insertBefore(node,anchor.nextSibling);anchor=node;});
+}
+const renderAllV51f=renderAll;
+renderAll=function(){renderAllV51f();setupHomeInfoButtons();optimiseHomeOrder();renderPlannerHealth();};
+window.addEventListener('pageshow',()=>{setupHomeInfoButtons();optimiseHomeOrder();renderPlannerHealth();});
+setTimeout(()=>{setupHomeInfoButtons();optimiseHomeOrder();renderPlannerHealth();},0);
+
+/* ===== v51 production — remembered collapsible Settings sections ===== */
+const SETTINGS_SECTION_STATE_KEY='myLifePlannerSettingsSections';
+function readSettingsSectionStates(){try{return JSON.parse(localStorage.getItem(SETTINGS_SECTION_STATE_KEY)||'{}')||{};}catch(error){return {};}}
+function initialiseSettingsSections(){
+  const states=readSettingsSectionStates();
+  document.querySelectorAll('#settingsDialog details.settings-section-details[data-settings-section]').forEach(section=>{
+    const key=section.dataset.settingsSection;
+    if(Object.prototype.hasOwnProperty.call(states,key)) section.open=Boolean(states[key]);
+    section.addEventListener('toggle',()=>{
+      const current=readSettingsSectionStates();
+      current[key]=section.open;
+      localStorage.setItem(SETTINGS_SECTION_STATE_KEY,JSON.stringify(current));
+    });
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initialiseSettingsSections);else initialiseSettingsSections();
+
+
+/* ===== v52a Calm Interface: information on demand across Lists and Planner ===== */
+const V52A_SECTION_HELP = {
+  'My Lists':'Search across every list or use the side navigation to jump to one collection.',
+  'To-do list':'Every saved to-do appears here. You can edit, complete or delete it.',
+  'Appointments and events':'Every appointment appears here. Select an item to edit it.',
+  'Recurring tasks':'Repeating responsibilities remain due or overdue until completed. Paused tasks stay saved but do not appear on Home.',
+  'Brain Inbox':'Capture anything without deciding where it belongs. Convert it later when its proper home becomes clear.',
+  'Waiting For':'Legacy label retained for compatibility.','Pending':'All items currently paused or waiting, gathered from their original lists.',
+  'Birthdays and memorable dates list':'Annual reminders for birthdays and other dates you want to remember.',
+  'Projects list':'Projects and their steps appear here for full editing and management.',
+  'Cleaning task list':'Cleaning jobs can repeat daily, weekly, fortnightly or monthly. Completing one schedules its next due date.',
+  'Custom lists':'Create collections for shopping, packing, ideas, places to visit or anything else.',
+  'Timeline':'Appointments and dated work are shown in date order. Use the filters to change the period.',
+  'Main list overview':'A quick count of the main information stored in your planner.',
+  'Gentle close-down':'Your editable end-of-day routine.'
+};
+function setupCalmSectionInfoButtons(){
+  document.querySelectorAll('.app-view-section[data-view="tasks"],.app-view-section[data-view="planner"]').forEach(section=>{
+    if(section.dataset.calmInfoReady==='1'||section.classList.contains('lists-floating-wrap'))return;
+    const heading=section.querySelector(':scope > .section-heading, :scope > .focus-heading');
+    if(!heading)return;
+    const headingCopy=heading.querySelector(':scope > div')||heading;
+    const h2=headingCopy.querySelector('h2');if(!h2)return;
+    const help=V52A_SECTION_HELP[h2.textContent.trim()];if(!help)return;
+    section.dataset.calmInfoReady='1';
+    const existingLine=h2.closest('.section-title-line');
+    const line=existingLine||document.createElement('div');
+    if(!existingLine){line.className='section-title-line';h2.parentNode.insertBefore(line,h2);line.appendChild(h2);}
+    const button=document.createElement('button');button.type='button';button.className='section-info-button';button.textContent='i';button.setAttribute('aria-label',`About ${h2.textContent.trim()}`);line.appendChild(button);
+    const descriptions=[...section.children].filter(el=>el.tagName==='P'&&el.classList.contains('card-meta'));
+    descriptions.forEach(el=>el.remove());
+    const text=document.createElement('p');text.className='section-help-text hidden';text.textContent=help;
+    heading.insertAdjacentElement('afterend',text);
+    button.onclick=e=>{e.stopPropagation();text.classList.toggle('hidden');button.setAttribute('aria-expanded',String(!text.classList.contains('hidden')));};
+    button.setAttribute('aria-expanded','false');
+  });
+}
+const renderAllV52a=renderAll;
+renderAll=function(){renderAllV52a();setupCalmSectionInfoButtons();};
+window.addEventListener('pageshow',setupCalmSectionInfoButtons);
+setTimeout(setupCalmSectionInfoButtons,0);
+
+/* ===== v52a corrected: Home order, compact heading controls and duplicate suppression ===== */
+function v52aTodayIdentitySet(){
+  const identities=new Set();
+  (getTodayReminderItems()||[]).forEach(item=>{
+    if(item.itemType==='todo') identities.add(`todo:${item.id}`);
+    if(item.itemType==='todoStep') identities.add(`todoParent:${item.parentId}`);
+    if(item.itemType==='step') identities.add(`project:${item.parentId}`);
+    if(item.itemType==='cleaning') identities.add(`cleaning:${item.id}`);
+    if(item.itemType==='appointment') identities.add(`appointment:${item.id}`);
+  });
+  return identities;
+}
+function focusCandidateRows(){
+  const rows=[];
+  const today=new Date(); today.setHours(12,0,0,0);
+  const alreadyShown=v52aTodayIdentitySet();
+  data.todos.filter(x=>!x.completed&&!alreadyShown.has(`todo:${x.id}`)&&!alreadyShown.has(`todoParent:${x.id}`)).forEach(x=>rows.push({name:x.name,meta:getTimingText(x),dueDate:x.dueDate,kind:'To-do',action:()=>toggleTodo(x.id),open:()=>editTodo(x.id),score:x.dueDate?daysBetween(today,dateOnly(x.dueDate)):40}));
+  data.cleaningTasks.filter(x=>isDueTodayOrEarlier(x.nextDue)&&!alreadyShown.has(`cleaning:${x.id}`)).forEach(x=>rows.push({name:x.name,meta:`Cleaning · ${x.room||'Home'}`,dueDate:x.nextDue,kind:'Cleaning',action:()=>completeCleaning(x.id),open:()=>editCleaning(x.id),score:-2}));
+  data.projects.filter(x=>!x.completed&&!alreadyShown.has(`project:${x.id}`)).forEach(p=>{const s=(p.steps||[]).find(x=>!x.completed && !x.pending);if(s)rows.push({name:s.name,meta:`Next action · ${p.name}`,dueDate:s.dueDate,kind:'Project',action:()=>toggleStep(p.id,s.id),open:()=>editStep(p.id,s.id),score:s.dueDate?daysBetween(today,dateOnly(s.dueDate)):12});});
+  data.waiting.filter(x=>!x.completed&&x.reviewDate&&dateOnly(x.reviewDate)<=today).forEach(x=>rows.push({name:x.name,meta:'Pending note · review due',dueDate:x.reviewDate,kind:'Waiting',open:()=>editCapture('waiting',x.id),score:0}));
+  return rows.sort((a,b)=>a.score-b.score).slice(0,7);
+}
+function optimiseHomeOrder(){
+  const quick=document.querySelector('.home-quick-actions');if(!quick)return;
+  const parent=quick.parentNode;
+  const today=document.getElementById('homeTodayPanel');
+  const week=document.getElementById('homeWeekPanel');
+  const oldGrid=today?.closest('.dashboard-grid')||week?.closest('.dashboard-grid');
+  [today,week].forEach(panel=>{
+    if(!panel)return;
+    panel.classList.remove('dashboard-card');
+    panel.classList.add('app-view-section');
+    panel.dataset.view='home';
+  });
+  if(oldGrid){
+    if(today) parent.insertBefore(today,oldGrid);
+    if(week) parent.insertBefore(week,oldGrid);
+    oldGrid.remove();
+  }
+  const ids=['homeTodayPanel','needsAttentionPanel','todayFocusPanel','plannerHealthPanel','homeProjectsPanel','homeWaitingPanel','homeBrainInboxPanel','homeRecurringPanel','homeWeekPanel','homeDailyRhythmPanel','homeEveningPanel'];
+  let anchor=quick;
+  ids.forEach(id=>{const el=document.getElementById(id);if(!el)return;parent.insertBefore(el,anchor.nextSibling);anchor=el;});
+}
+function applyV52aCorrectedHome(){
+  optimiseHomeOrder();
+  initialiseHomeCollapsibles();
+  renderFocusToday();
+}
+window.addEventListener('pageshow',applyV52aCorrectedHome);
+setTimeout(applyV52aCorrectedHome,0);
+
+
+/* ===== v52b Planner Health 2.0 and considerate pattern memory ===== */
+const V52B_PATTERN_KEY='myLifePlannerTaskPatterns';
+const V52B_LEGACY_PATTERN_KEY='myLifePlannerHabitHistory';
+function v52bNormaliseName(value){return String(value||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();}
+function v52bRawStore(key){try{return JSON.parse(localStorage.getItem(key)||'{}')||{};}catch(e){return {};}}
+function v52bMergePatternStores(){
+ const current=v52bRawStore(V52B_PATTERN_KEY),legacy=v52bRawStore(V52B_LEGACY_PATTERN_KEY),merged={...current};
+ Object.entries(legacy).forEach(([rawKey,entry])=>{
+  const key=v52bNormaliseName(rawKey||entry?.name);if(!key)return;
+  const existing=merged[key]||{name:entry?.name||rawKey,count:0,sources:{},lastSeen:0};
+  existing.name=entry?.name||existing.name||rawKey;
+  existing.count=Math.max(Number(existing.count||0),Number(entry?.count||0));
+  existing.sources=existing.sources||{};existing.sources.focus=Math.max(Number(existing.sources.focus||0),Number(entry?.count||0));
+  existing.lastSeen=Math.max(Number(existing.lastSeen||0),Number(entry?.lastSeen||0));merged[key]=existing;
+ });
+ try{localStorage.setItem(V52B_PATTERN_KEY,JSON.stringify(merged));}catch(e){}
+ return merged;
+}
+function v52bPatterns(){return v52bMergePatternStores();}
+function v52bSavePatterns(value){try{localStorage.setItem(V52B_PATTERN_KEY,JSON.stringify(value));}catch(e){}}
+function v52bRecordPattern(name,source='focus'){
+ const key=v52bNormaliseName(name);if(!key||key.length<3)return;
+ const all=v52bPatterns(), item=all[key]||{name:String(name).trim(),count:0,sources:{},lastSeen:0};
+ item.name=String(name).trim()||item.name;item.count=Number(item.count||0)+1;item.sources=item.sources||{};item.sources[source]=Number(item.sources[source]||0)+1;item.lastSeen=Date.now();all[key]=item;v52bSavePatterns(all);
+}
+const v52bAddTodayFocusBase=addTodayFocusItem;
+addTodayFocusItem=function(event){
+ const name=document.getElementById('todayFocusInput')?.value?.trim();
+ if(name)v52bRecordPattern(name,'focus');
+ const result=v52bAddTodayFocusBase(event);
+ renderPlannerHealth();
+ if(typeof renderDailyCompanion==='function')renderDailyCompanion();
+ return result;
+};
+function v52bPatternAlreadyStructured(name){const n=v52bNormaliseName(name);return [...(data.recurringTasks||[]),...(data.cleaningTasks||[])].some(x=>v52bNormaliseName(x.name)===n);}
+function v52bSuggestRecurring(name){openRecurringTaskDialog();const field=document.getElementById('recurringTaskName');if(field)field.value=name;const unit=document.getElementById('recurringTaskUnit');if(unit)unit.value='month';const interval=document.getElementById('recurringTaskInterval');if(interval)interval.value=1;updateRecurringRuleControls();}
+function plannerHealthSuggestions(){
+ const suggestions=[];
+ (data.projects||[]).filter(x=>!x.completed).forEach(x=>{const age=ageInDays(x.updatedAt||x.createdAt);if(age!==null&&age>=7)suggestions.push({key:`project:${x.id}`,severity:Math.min(3,1+Math.floor(age/14)),title:'A project may need a little momentum',copy:`${x.name||'This project'} has not recorded progress for ${age} days. Would opening the next step help?`,actionLabel:'Open project',open:()=>{showAppView('home');setTimeout(()=>{document.getElementById('homeProjectsPanel')?.scrollIntoView({behavior:'smooth',block:'start'});editProject(x.id);},120);}});});
+ const oldInbox=(data.inbox||[]).filter(x=>x.status!=='processed'&&ageInDays(x.updatedAt||x.createdAt)>=7);
+ if(oldInbox.length)suggestions.push({key:`inbox-group:${oldInbox.map(x=>x.id).sort().join(',')}`,severity:oldInbox.length>=5?2:1,title:'Some captured thoughts are ready for a decision',copy:`${oldInbox.length} Brain Inbox item${oldInbox.length===1?' has':'s have'} been waiting for more than a week. A short review may clear useful ideas.`,actionLabel:'Review Brain Inbox',open:()=>{showAppView('tasks');setTimeout(()=>document.getElementById('inboxListSection')?.scrollIntoView({behavior:'smooth',block:'start'}),100);}});
+ (data.waiting||[]).filter(x=>!x.completed).forEach(x=>{const age=ageInDays(x.updatedAt||x.createdAt);if(age!==null&&age>=10)suggestions.push({key:`waiting:${x.id}`,severity:age>=21?3:2,title:'A follow-up may be useful',copy:`${x.name||'This pending note'} has been pending for ${age} days.`,actionLabel:'Open item',open:()=>{showAppView('tasks');setTimeout(()=>editCapture('waiting',x.id),100);}});});
+ (data.cleaningTasks||[]).filter(x=>!x.completed&&x.nextDue&&x.nextDue<localDateKey()).forEach(x=>{const days=Math.abs(daysBetween(new Date(),dateOnly(x.nextDue)));suggestions.push({key:`clean:${x.id}`,severity:days>=7?3:2,title:'A cleaning task is still waiting',copy:`${x.name||'This cleaning task'} is overdue${days?` by ${days} day${days===1?'':'s'}`:''}.`,actionLabel:'Open task',open:()=>editCleaning(x.id)});});
+ Object.values(v52bPatterns()).filter(x=>Number(x.count||0)>=3&&!v52bPatternAlreadyStructured(x.name)).sort((a,b)=>Number(b.count)-Number(a.count)).slice(0,3).forEach(x=>suggestions.push({key:`pattern:${v52bNormaliseName(x.name)}`,severity:1,title:'Would you like the planner to remember this?',copy:`You have added “${x.name}” ${x.count} times. It may work better as a recurring task.`,actionLabel:'Make recurring',open:()=>v52bSuggestRecurring(x.name)}));
+ return suggestions.filter(x=>!healthHidden(x.key)).sort((a,b)=>b.severity-a.severity);
+}
+function renderPlannerHealth(){
+ const area=document.getElementById('plannerHealthArea');if(!area)return;
+ const all=plannerHealthSuggestions();
+ const overdueCount=(data.todos||[]).filter(x=>!x.completed&&x.dueDate&&x.dueDate<localDateKey()).length+(data.recurringTasks||[]).filter(x=>x.status!=='paused'&&x.nextDue&&x.nextDue<localDateKey()).length+(data.cleaningTasks||[]).filter(x=>!x.completed&&x.nextDue&&x.nextDue<localDateKey()).length;
+ const status=overdueCount>=4||all.some(x=>x.severity>=3)?['attention','🟠 Needs attention']:overdueCount||all.length?['good','🟡 Good']:['excellent','🟢 Excellent'];
+ if(!all.length){area.innerHTML=`<div class="planner-health-card"><div class="planner-health-top"><span class="health-status ${status[0]}">${status[1]}</span></div><div class="planner-health-empty">Nothing needs a special nudge right now.</div></div>`;return;}
+ const item=all[0];area.innerHTML=`<div class="planner-health-card"><div class="planner-health-top"><span class="health-status ${status[0]}">${status[1]}</span><span class="badge">One helpful thought</span></div><div class="planner-suggestion-title">${escapeHtml(item.title)}</div><div class="planner-suggestion-copy">${escapeHtml(item.copy)}</div><div class="planner-suggestion-actions"><button type="button" id="healthOpenButton">${escapeHtml(item.actionLabel||'Open')}</button><button type="button" class="secondary-button" onclick="rememberHealth('${item.key}','snooze')">Snooze 7 days</button><button type="button" class="secondary-button" onclick="rememberHealth('${item.key}','dismiss')">Dismiss</button></div></div>`;
+ document.getElementById('healthOpenButton').onclick=item.open;
+}
+setTimeout(()=>{renderPlannerHealth();},0);
+
+
+/* ===== v52c Daily Companion — Morning Brief, glance cards and time awareness ===== */
+function v52cDaypart(now=new Date()){
+  const hour=now.getHours();
+  if(hour<12)return {key:'morning',eyebrow:'Your morning',greeting:'Good morning',message:'Here is the shape of your day. Start with what is fixed, then choose what feels manageable.'};
+  if(hour<17)return {key:'afternoon',eyebrow:'Your afternoon',greeting:'Good afternoon',message:'A quick check-in for the rest of today. Keep what matters visible and let the rest wait.'};
+  return {key:'evening',eyebrow:'Your evening',greeting:'Good evening',message:'Here is what still matters today. Anything else can be considered tomorrow.'};
+}
+function v52cTodayAppointments(){
+  const today=localDateKey();
+  return appointmentDashboardItems().filter(item=>item.dueDate===today);
+}
+function v52cActiveFocus(){return (data.todayFocus||[]).filter(item=>!item.completed);}
+function v52cUrgentItems(){
+  try{return getTodayReminderItems().filter(item=>item.itemType!=='appointment');}catch(e){return [];}
+}
+function v52cDueRecurring(){
+  const today=localDateKey();
+  return (data.recurringTasks||[]).filter(item=>item.status!=='paused'&&item.nextDue&&item.nextDue<=today);
+}
+function v52cWaitingFollowups(){
+  const today=new Date();today.setHours(12,0,0,0);
+  return (data.waiting||[]).filter(item=>!item.completed&&item.reviewDate&&dateOnly(item.reviewDate)<=today);
+}
+function v52cOpenInbox(){return (data.inbox||[]).filter(item=>item.status!=='processed');}
+function v52cLatestBackup(){
+  const copies=getDailyBackups();
+  if(!copies.length)return {label:'Not yet',tone:'attention'};
+  const saved=new Date(copies[0].savedAt||`${copies[0].date}T12:00:00`);
+  const age=Math.max(0,Math.floor((Date.now()-saved.getTime())/86400000));
+  return {label:age===0?'Today':age===1?'Yesterday':`${age} days ago`,tone:age>=7?'attention':age>=3?'good':'excellent'};
+}
+function v52cHealthSummary(){
+  const suggestions=plannerHealthSuggestions();
+  const severe=suggestions.some(item=>item.severity>=3);
+  const overdue=v52cUrgentItems().filter(item=>item.dueDate&&item.dueDate<localDateKey()).length;
+  if(severe||overdue>=4)return {label:'Needs attention',tone:'attention',detail:suggestions.length?'A helpful suggestion is waiting.':'Several dated items need a look.'};
+  if(suggestions.length||overdue)return {label:'Good',tone:'good',detail:suggestions.length?'One helpful thought is available.':'A small number of items need attention.'};
+  return {label:'Excellent',tone:'excellent',detail:'Nothing needs a special nudge.'};
+}
+function v52cEstimatedMinutes(){
+  const focus=v52cActiveFocus().reduce((sum,item)=>sum+Math.max(0,Number(item.estimatedMinutes)||0),0);
+  const appointments=v52cTodayAppointments().reduce((sum,item)=>{
+    const original=(data.appointments||[]).find(a=>String(a.id)===String(item.id));
+    if(!original?.time||!original?.endTime)return sum;
+    const [sh,sm]=original.time.split(':').map(Number),[eh,em]=original.endTime.split(':').map(Number);
+    return sum+Math.max(0,(eh*60+em)-(sh*60+sm));
+  },0);
+  return focus+appointments;
+}
+function v52cSummaryTile(icon,value,label){return `<div class="companion-summary-tile"><span aria-hidden="true">${icon}</span><strong>${value}</strong><small>${escapeHtml(label)}</small></div>`;}
+function v52cDashboardCard(title,value,detail,tone='neutral',target=''){
+  const attr=target?` data-companion-target="${target}" role="button" tabindex="0"`:'';
+  return `<article class="companion-dashboard-card ${tone}"${attr}><span>${escapeHtml(title)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></article>`;
+}
+function v52cOpenTarget(target){
+  const actions={health:()=>document.getElementById('plannerHealthPanel')?.scrollIntoView({behavior:'smooth',block:'start'}),backup:()=>openSettingsDialog(),inbox:()=>{showAppView('tasks');setTimeout(()=>document.getElementById('inboxListSection')?.scrollIntoView({behavior:'smooth'}),100);},waiting:()=>openWaitingForList(),recurring:()=>{showAppView('tasks');setTimeout(()=>document.getElementById('recurringTasksListSection')?.scrollIntoView({behavior:'smooth'}),100);}};
+  actions[target]?.();
+}
+const V52C_COMPANION_EXPANDED_KEY='myLifePlannerCompanionExpandedV52c1';
+function v52cIsPhone(){return window.matchMedia('(max-width: 600px)').matches;}
+function v52cCompanionExpanded(){return localStorage.getItem(V52C_COMPANION_EXPANDED_KEY)==='true';}
+function v52cApplyCompanionLayout(){
+ const panel=document.getElementById('morningBriefPanel'),button=document.getElementById('dailyCompanionToggle');if(!panel)return;
+ const compact=v52cIsPhone()&&!v52cCompanionExpanded();panel.classList.toggle('companion-compact',compact);
+ if(button){button.hidden=!v52cIsPhone();button.textContent=compact?'More':'Less';button.setAttribute('aria-expanded',String(!compact));}
+}
+function toggleDailyCompanion(){localStorage.setItem(V52C_COMPANION_EXPANDED_KEY,String(!v52cCompanionExpanded()));v52cApplyCompanionLayout();}
+function renderDailyCompanion(){
+  const panel=document.getElementById('morningBriefPanel');if(!panel)return;
+  const now=new Date(),part=v52cDaypart(now),settings=getSettings?.()||{},name=String(settings.ownerName||'').trim();
+  document.getElementById('daypartEyebrow').textContent=part.eyebrow;
+  document.getElementById('dailyCompanionGreeting').textContent=`${part.greeting}${name?`, ${name}`:''}`;
+  document.getElementById('dailyCompanionMessage').textContent=part.message;
+  document.getElementById('dailyCompanionDate').textContent=now.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long'});
+  const appointments=v52cTodayAppointments().length,focus=v52cActiveFocus().length,urgent=v52cUrgentItems().length,suggestions=plannerHealthSuggestions().length;
+  const minutes=v52cEstimatedMinutes();
+  document.getElementById('dailyCompanionSummary').innerHTML=[
+    v52cSummaryTile('📅',appointments,appointments===1?'appointment':'appointments'),
+    v52cSummaryTile('☀️',focus,focus===1?'focus item':'focus items'),
+    v52cSummaryTile('⚠️',urgent,urgent===1?'dated item':'dated items'),
+    v52cSummaryTile('💡',suggestions,suggestions===1?'suggestion':'suggestions')
+  ].join('')+(minutes?`<p class="companion-workload">Planned or timed work: about ${minutes<60?`${minutes} minutes`:`${Math.round(minutes/30)/2} hours`}.</p>`:'');
+  const health=v52cHealthSummary(),backup=v52cLatestBackup(),inbox=v52cOpenInbox().length,waiting=v52cWaitingFollowups().length,recurring=v52cDueRecurring().length;
+  document.getElementById('companionDashboardCards').innerHTML=[
+    v52cDashboardCard('Planner Health',health.label,health.detail,health.tone,'health'),
+    v52cDashboardCard('Last backup',backup.label,'Open Backup and restore',backup.tone,'backup'),
+    v52cDashboardCard('Brain Inbox',String(inbox),inbox===1?'item waiting':'items waiting',inbox?'good':'excellent','inbox'),
+    v52cDashboardCard('Waiting For',String(waiting),waiting===1?'follow-up due':'follow-ups due',waiting?'good':'excellent','waiting'),
+    v52cDashboardCard('Recurring',String(recurring),recurring===1?'due now':'due now',recurring?'good':'excellent','recurring')
+  ].join('');
+  panel.dataset.daypart=part.key;
+  panel.querySelectorAll('[data-companion-target]').forEach(card=>{const go=()=>v52cOpenTarget(card.dataset.companionTarget);card.onclick=go;card.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go();}};});
+  v52cApplyCompanionLayout();
+}
+function v52cOptimiseHomeOrder(){
+  optimiseHomeOrder();
+  const quick=document.querySelector('.home-quick-actions'),brief=document.getElementById('morningBriefPanel');
+  if(quick&&brief)quick.parentNode.insertBefore(brief,quick.nextSibling);
+}
+const renderAllV52cBase=renderAll;
+renderAll=function(){renderAllV52cBase();v52cOptimiseHomeOrder();renderDailyCompanion();};
+window.addEventListener('pageshow',()=>{v52cOptimiseHomeOrder();renderDailyCompanion();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)renderDailyCompanion();});
+window.addEventListener('resize',v52cApplyCompanionLayout);
+setTimeout(()=>{v52cOptimiseHomeOrder();renderDailyCompanion();},0);
+
+
+/* ===== v52d Daily Companion Part 2: reflections, memory and hidden statistics ===== */
+const V52D_ACTIVITY_KEY='myLifePlannerActivityLog';
+const V52D_PREFS_KEY='myLifePlannerCompanionPreferences';
+const V52D_DISMISS_KEY='myLifePlannerReflectionDismissals';
+function v52dRead(key,fallback){try{return JSON.parse(localStorage.getItem(key)||'null')??fallback;}catch(e){return fallback;}}
+function v52dWrite(key,value){try{localStorage.setItem(key,JSON.stringify(value));}catch(e){}}
+function v52dLog(type,name='',extra={}){const log=v52dRead(V52D_ACTIVITY_KEY,[]);log.push({id:uid(),type,name:String(name||''),at:new Date().toISOString(),weekday:new Date().getDay(),...extra});v52dWrite(V52D_ACTIVITY_KEY,log.slice(-2500));}
+function v52dDateStart(days){const d=new Date();d.setHours(0,0,0,0);d.setDate(d.getDate()-days);return d;}
+function v52dEventsSince(start){return v52dRead(V52D_ACTIVITY_KEY,[]).filter(e=>new Date(e.at)>=start);}
+function v52dPrefs(){return {...{weeklyTiming:'sunday'},...v52dRead(V52D_PREFS_KEY,{})};}
+function saveCompanionPreferences(){const timing=document.getElementById('weeklyReflectionTiming')?.value||'sunday';v52dWrite(V52D_PREFS_KEY,{weeklyTiming:timing});renderWeeklyReflection();}
+function v52dLoadPreferences(){const el=document.getElementById('weeklyReflectionTiming');if(el)el.value=v52dPrefs().weeklyTiming;}
+function v52dDismissals(){return v52dRead(V52D_DISMISS_KEY,{});}
+function dismissEveningReflection(){const d=v52dDismissals();d.evening=localDateKey();v52dWrite(V52D_DISMISS_KEY,d);document.getElementById('eveningReflectionPanel')?.classList.add('hidden');}
+function v52dWeekKey(date=new Date()){const d=new Date(date);const day=(d.getDay()+6)%7;d.setHours(0,0,0,0);d.setDate(d.getDate()-day);return d.toISOString().slice(0,10);}
+function dismissWeeklyReflection(){const d=v52dDismissals();d.week=v52dWeekKey();v52dWrite(V52D_DISMISS_KEY,d);document.getElementById('weeklyReflectionPanel')?.classList.add('hidden');}
+function v52dCount(events,type){return events.filter(e=>e.type===type).length;}
+function v52dMetric(value,label){return `<div class="reflection-metric"><strong>${value}</strong><span>${escapeHtml(label)}</span></div>`;}
+function v52dGentleMessage(done,remaining,hour=new Date().getHours()){
+ if(done>=8)return hour>=18?'You have done plenty today. It is reasonable to leave the rest for another day.':'You have already moved a lot forward today. Keep the rest gentle.';
+ if(done>=3)return 'There has been useful progress today. Anything else is a bonus.';
+ if(remaining>0)return 'A small step still counts. Choose one manageable item if you have the energy.';
+ return 'Nothing is pressing. You can enjoy the space you have made.';
+}
+function renderEveningReflection(){const panel=document.getElementById('eveningReflectionPanel'),area=document.getElementById('eveningReflectionArea');if(!panel||!area)return;const now=new Date(),dismiss=v52dDismissals();if(now.getHours()<18||dismiss.evening===localDateKey()){panel.classList.add('hidden');return;}const start=new Date();start.setHours(0,0,0,0);const events=v52dEventsSince(start);const focusCompleted=(data.todayFocus||[]).filter(x=>x.completed&&x.completedAt&&new Date(x.completedAt)>=start).length;const tasks=v52dCount(events,'todo')+v52dCount(events,'todoStep')+focusCompleted;const steps=v52dCount(events,'projectStep');const cleaning=v52dCount(events,'cleaning');const organised=v52dCount(events,'inboxProcessed');const remaining=v52cActiveFocus().length+v52cUrgentItems().length+v52cDueRecurring().length;area.innerHTML=`<div class="reflection-summary"><p class="reflection-intro">A calm record of what moved today.</p><div class="reflection-metrics">${v52dMetric(tasks,'tasks completed')}${v52dMetric(steps,'project steps')}${v52dMetric(cleaning,'cleaning jobs')}${v52dMetric(organised,'inbox items organised')}</div><div class="reflection-note">${escapeHtml(v52dGentleMessage(tasks+steps+cleaning+organised,remaining))}</div>${remaining?`<div class="reflection-note"><strong>${remaining}</strong> item${remaining===1?'':'s'} remain visible for attention. They do not all have to be done tonight.</div>`:''}</div>`;panel.classList.remove('hidden');}
+function v52dWeeklyWindow(){const end=new Date();end.setHours(23,59,59,999);const start=new Date(end);start.setDate(start.getDate()-6);start.setHours(0,0,0,0);return {start,end};}
+function renderWeeklyReflection(){const panel=document.getElementById('weeklyReflectionPanel'),area=document.getElementById('weeklyReflectionArea');if(!panel||!area)return;const now=new Date(),pref=v52dPrefs().weeklyTiming,dismiss=v52dDismissals();const show=(pref==='sunday'&&now.getDay()===0&&now.getHours()>=17)||(pref==='monday'&&now.getDay()===1&&now.getHours()<12);if(!show||dismiss.week===v52dWeekKey()){panel.classList.add('hidden');return;}const {start}=v52dWeeklyWindow(),events=v52dEventsSince(start);const tasks=v52dCount(events,'todo')+v52dCount(events,'todoStep')+v52dCount(events,'focus');const steps=v52dCount(events,'projectStep');const cleaning=v52dCount(events,'cleaning');const waiting=(data.waiting||[]).filter(x=>!x.completed).length;const inactive=(data.projects||[]).filter(x=>!x.completed&&ageInDays(x.updatedAt||x.createdAt)>=7).length;let note=steps?'At least one project moved forward this week.':'No project step was recorded this week. That may be perfectly appropriate, or one project might deserve a small next action.';if(inactive)note+=` ${inactive} project${inactive===1?' has':'s have'} been quiet for at least a week.`;area.innerHTML=`<div class="reflection-summary"><p class="reflection-intro">A brief view of the last seven days, without judgement.</p><div class="reflection-metrics">${v52dMetric(tasks,'tasks completed')}${v52dMetric(steps,'project steps')}${v52dMetric(cleaning,'cleaning jobs')}${v52dMetric(waiting,'Pending notes open')}</div><div class="reflection-note">${escapeHtml(note)}</div></div>`;panel.classList.remove('hidden');}
+function v52dPeriodStart(period){const d=new Date();d.setHours(0,0,0,0);if(period==='week'){d.setDate(d.getDate()-6);}else if(period==='month'){d.setDate(1);}else return new Date(0);return d;}
+function renderHiddenStatistics(){const area=document.getElementById('hiddenStatisticsArea');if(!area)return;const period=document.getElementById('statisticsPeriod')?.value||'week',events=v52dEventsSince(v52dPeriodStart(period));const completed=events.filter(e=>['todo','todoStep','focus','projectStep','cleaning','recurring'].includes(e.type)).length;const projects=new Set(events.filter(e=>e.type==='projectStep').map(e=>e.projectId).filter(Boolean)).size;const cleaning=v52dCount(events,'cleaning');const inbox=v52dCount(events,'inboxProcessed');const days=[0,0,0,0,0,0,0];events.forEach(e=>days[Number(e.weekday)||0]++);const names=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];const max=Math.max(...days);const active=max?names[days.indexOf(max)]:'Not enough data yet';area.innerHTML=`<div class="stat-card"><span>Recorded completions</span><strong>${completed}</strong></div><div class="stat-card"><span>Projects progressed</span><strong>${projects}</strong></div><div class="stat-card"><span>Cleaning jobs completed</span><strong>${cleaning}</strong></div><div class="stat-card"><span>Brain Inbox organised</span><strong>${inbox}</strong></div><div class="stat-card"><span>Most active weekday</span><strong>${escapeHtml(active)}</strong></div><div class="stat-card"><span>Activity records available</span><strong>${events.length}</strong></div>`;}
+function v52dPatternSuggestions(){const events=v52dEventsSince(v52dDateStart(60)).filter(e=>['focus','cleaning','todo'].includes(e.type)&&e.name);const grouped={};events.forEach(e=>{const key=v52bNormaliseName(e.name);if(!key)return;(grouped[key]??={name:e.name,days:[],count:0}).count++;grouped[key].days.push(e.weekday);});return Object.entries(grouped).filter(([key,g])=>g.count>=3&&!v52bPatternAlreadyStructured(g.name)).map(([key,g])=>{const counts=[0,0,0,0,0,0,0];g.days.forEach(d=>counts[d]++);const best=Math.max(...counts),weekday=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][counts.indexOf(best)];return {key:`memory:${key}`,severity:1,title:'A routine may be forming',copy:`You have completed “${g.name}” ${g.count} times${best>=2?`, often on ${weekday}`:''}. Would you like to make it recurring?`,actionLabel:'Make recurring',open:()=>v52bSuggestRecurring(g.name)};});}
+const plannerHealthSuggestionsV52dBase=plannerHealthSuggestions;
+plannerHealthSuggestions=function(){return [...plannerHealthSuggestionsV52dBase(),...v52dPatternSuggestions()].filter((x,i,a)=>a.findIndex(y=>y.key===x.key)===i).sort((a,b)=>b.severity-a.severity);};
+// Record completions from v52d onward without changing existing data structures.
+const toggleTodoV52dBase=toggleTodo;toggleTodo=function(id){const item=data.todos.find(x=>x.id===id),was=Boolean(item?.completed);toggleTodoV52dBase(id);if(item&&!was&&item.completed)v52dLog('todo',item.name,{itemId:id});};
+const toggleTodoStepV52dBase=toggleTodoStep;toggleTodoStep=function(todoId,stepId){const todo=data.todos.find(x=>x.id===todoId),step=todo?.steps?.find(x=>x.id===stepId),was=Boolean(step?.completed);toggleTodoStepV52dBase(todoId,stepId);if(step&&!was&&step.completed)v52dLog('todoStep',step.name,{parentId:todoId});};
+const toggleStepV52dBase=toggleStep;toggleStep=function(projectId,stepId){const project=data.projects.find(x=>x.id===projectId),step=project?.steps?.find(x=>x.id===stepId),was=Boolean(step?.completed);toggleStepV52dBase(projectId,stepId);if(step&&!was&&step.completed)v52dLog('projectStep',step.name,{projectId});};
+const completeCleaningV52dBase=completeCleaning;completeCleaning=function(id){const item=(data.cleaningTasks||[]).find(x=>String(x.id)===String(id));completeCleaningV52dBase(id);if(item)v52dLog('cleaning',item.name,{itemId:id});};
+const completeRecurringTaskV52dBase=typeof completeRecurringTask==='function'?completeRecurringTask:null;if(completeRecurringTaskV52dBase)completeRecurringTask=function(id){const item=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));completeRecurringTaskV52dBase(id);if(item)v52dLog('recurring',item.name,{itemId:id});};
+const toggleTodayFocusItemV52dBase=toggleTodayFocusItem;toggleTodayFocusItem=function(id){const item=(data.todayFocus||[]).find(x=>String(x.id)===String(id)),was=Boolean(item?.completed);toggleTodayFocusItemV52dBase(id);if(item&&!was&&item.completed)v52dLog('focus',item.name,{itemId:id});renderEveningReflection();renderHiddenStatistics();};
+function v52dRenderCompanionPart2(){v52dLoadPreferences();renderEveningReflection();renderWeeklyReflection();renderHiddenStatistics();}
+const renderAllV52dBase=renderAll;renderAll=function(){renderAllV52dBase();v52dRenderCompanionPart2();};
+window.addEventListener('pageshow',v52dRenderCompanionPart2);document.addEventListener('visibilitychange',()=>{if(!document.hidden)v52dRenderCompanionPart2();});setTimeout(v52dRenderCompanionPart2,0);
+
+
+/* ===== v52f Polish Release ===== */
+const V52F_ROOM_KEY='myLifePlannerLastCleaningRoom';
+const V52F_RECUR_KEY='myLifePlannerLastRecurringUnit';
+function v52fRoomNames(){
+  return [...new Set((data.cleaningTasks||[]).map(x=>String(x.room||'').trim()).filter(Boolean))]
+    .sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+}
+function refreshCleaningRoomSuggestions(){
+  const list=document.getElementById('cleaningRoomSuggestions');if(!list)return;
+  list.innerHTML=v52fRoomNames().map(room=>`<option value="${escapeHtml(room)}"></option>`).join('');
+}
+function applyCleaningRoomDefault(){
+  const input=document.getElementById('cleaningRoom');if(!input||input.value.trim())return;
+  const last=localStorage.getItem(V52F_ROOM_KEY)||'';
+  if(last)input.value=last;
+}
+const v52fOpenCleaningBase=typeof openCleaningDialog==='function'?openCleaningDialog:null;
+if(v52fOpenCleaningBase){openCleaningDialog=function(id=''){v52fOpenCleaningBase(id);refreshCleaningRoomSuggestions();if(!id)applyCleaningRoomDefault();};}
+const v52fSaveDataBase=saveData;
+saveData=function(){
+  const room=document.getElementById('cleaningRoom')?.value?.trim();
+  if(room&&!document.getElementById('cleaningAreaLabel')?.classList.contains('hidden'))localStorage.setItem(V52F_ROOM_KEY,room);
+  const unit=document.getElementById('recurringTaskUnit')?.value;
+  if(unit&&document.getElementById('recurringTaskDialog')?.open)localStorage.setItem(V52F_RECUR_KEY,unit);
+  return v52fSaveDataBase();
+};
+const v52fOpenRecurringBase=typeof openRecurringTaskDialog==='function'?openRecurringTaskDialog:null;
+if(v52fOpenRecurringBase){openRecurringTaskDialog=function(id=''){v52fOpenRecurringBase(id);if(!id){const unit=localStorage.getItem(V52F_RECUR_KEY);if(unit){const el=document.getElementById('recurringTaskUnit');if(el){el.value=unit;updateRecurringRuleControls();}}}};}
+function v52fFocusGlobalSearch(){
+  const search=document.getElementById('globalListSearch');if(!search)return;
+  const listsButton=document.querySelector('.nav-button[data-tab="tasks"]');showAppView('tasks',listsButton);setTimeout(()=>{search.focus();search.select();},60);
+}
+document.addEventListener('keydown',event=>{
+  const tag=(event.target?.tagName||'').toLowerCase();const typing=['input','textarea','select'].includes(tag)||event.target?.isContentEditable;
+  if(event.key==='/'&&!typing){event.preventDefault();v52fFocusGlobalSearch();}
+  if((event.ctrlKey||event.metaKey)&&event.shiftKey&&event.key.toLowerCase()==='f'){event.preventDefault();v52fFocusGlobalSearch();}
+});
+function v52fPolishRefresh(){refreshCleaningRoomSuggestions();document.documentElement.classList.add('v52f-ready');}
+const v52fRenderAllBase=renderAll;renderAll=function(){v52fRenderAllBase();v52fPolishRefresh();};
+window.addEventListener('pageshow',v52fPolishRefresh);setTimeout(v52fPolishRefresh,0);
+
+
+/* ===== v53 Corrected Workflow Edition =====
+   Built on the accepted v52f baseline. Convert behaves as Move, but the
+   original Today’s Focus item is removed only after a successful save.
+*/
+let v53PendingFocusMove={id:'',type:''};
+let v53FocusMoveSaving=false;
+function v53BeginFocusMove(id,type){v53PendingFocusMove={id:String(id||''),type:String(type||'')};}
+function v53ClearFocusMove(){v53PendingFocusMove={id:'',type:''};}
+function v53FinishFocusMove(type){
+  if(!v53PendingFocusMove.id||v53PendingFocusMove.type!==type)return false;
+  const id=v53PendingFocusMove.id;
+  const existed=(data.todayFocus||[]).some(item=>String(item.id)===id);
+  if(existed)data.todayFocus=(data.todayFocus||[]).filter(item=>String(item.id)!==id);
+  v53ClearFocusMove();
+  if(existed){saveData();renderAll();showSaved("Moved from Today’s Focus");}
+  return existed;
+}
+
+const v53CloseAddDialogBase=closeAddDialog;
+closeAddDialog=function(){if(!v53FocusMoveSaving)v53ClearFocusMove();return v53CloseAddDialogBase();};
+if(addForm){
+  addForm.addEventListener('submit',()=>{
+    const type=itemType?.value||'';
+    if(v53PendingFocusMove.id&&v53PendingFocusMove.type===type)v53FocusMoveSaving=true;
+  },true);
+  addForm.addEventListener('submit',()=>{
+    const type=itemType?.value||'';
+    if(!v53PendingFocusMove.id||v53PendingFocusMove.type!==type)return;
+    setTimeout(()=>{
+      const saved=!dialog.open;
+      v53FocusMoveSaving=false;
+      if(saved)v53FinishFocusMove(type);
+    },0);
+  });
+}
+
+const v53CloseAppointmentDialogBase=closeAppointmentDialog;
+closeAppointmentDialog=function(){if(!v53FocusMoveSaving)v53ClearFocusMove();return v53CloseAppointmentDialogBase();};
+const v53SaveAppointmentBase=saveAppointment;
+saveAppointment=function(){
+  const moving=v53PendingFocusMove.id&&v53PendingFocusMove.type==='appointment';
+  if(moving)v53FocusMoveSaving=true;
+  const saved=v53SaveAppointmentBase();
+  v53FocusMoveSaving=false;
+  if(saved&&moving)v53FinishFocusMove('appointment');
+  return saved;
+};
+
+const v53CloseRecurringTaskDialogBase=closeRecurringTaskDialog;
+closeRecurringTaskDialog=function(){if(!v53FocusMoveSaving)v53ClearFocusMove();return v53CloseRecurringTaskDialogBase();};
+const v53SaveRecurringTaskBase=saveRecurringTask;
+saveRecurringTask=function(event){
+  const moving=v53PendingFocusMove.id&&v53PendingFocusMove.type==='recurring';
+  if(moving)v53FocusMoveSaving=true;
+  const result=v53SaveRecurringTaskBase(event);
+  const saved=!document.getElementById('recurringTaskDialog')?.open;
+  v53FocusMoveSaving=false;
+  if(saved&&moving)v53FinishFocusMove('recurring');
+  return result;
+};
+
+convertTodayFocus=function(id,type){
+  const item=focusItemById(id);if(!item)return;
+  const name=item.name||'',details=item.notes||'';
+  v53BeginFocusMove(id,type);
+  if(type==='todo'||type==='project'||type==='cleaning'){
+    openAddDialog(type);
+    document.getElementById('itemName').value=name;
+    document.getElementById('itemDetails').value=details;
+    if(type==='cleaning'){
+      document.getElementById('cleaningFrequency').value='monthly';
+      document.getElementById('cleaningStartDate').value=localDateKey();
+      document.getElementById('cleaningFrequency').dispatchEvent(new Event('change',{bubbles:true}));
+    }
+  }else if(type==='recurring'){
+    openRecurringTaskDialog();
+    document.getElementById('recurringTaskName').value=name;
+    document.getElementById('recurringTaskNotes').value=details;
+    document.getElementById('recurringTaskUnit').value='month';
+    document.getElementById('recurringTaskInterval').value=1;
+    updateRecurringRuleControls();
+  }else if(type==='appointment'){
+    openAppointmentDialog('',name,details);
+  }else if(type==='waiting'){
+    data.waiting.unshift({id:uid(),name,note:details,reviewDate:'',completed:false,createdAt:new Date().toISOString()});
+    saveData();
+    v53FinishFocusMove('waiting');
+  }else{
+    v53ClearFocusMove();
+  }
+};
+
+
+/* ===== v53a Workflow & Stability ===== */
+const V53A_VERSION='53a';
+const V53A_ROUTINE_DATE_KEY='myLifePlannerRoutineDate';
+
+function v53aPlaceHomeSections(){
+  const parent=document.querySelector('.home-quick-actions')?.parentElement;if(!parent)return;
+  const brief=document.getElementById('morningBriefPanel');
+  const evening=document.getElementById('eveningReflectionPanel');
+  const weekly=document.getElementById('weeklyReflectionPanel');
+  const today=document.getElementById('homeTodayPanel');
+  const needs=document.getElementById('needsAttentionPanel');
+  const focus=document.getElementById('todayFocusPanel');
+  const health=document.getElementById('plannerHealthPanel');
+  const projects=document.getElementById('homeProjectsPanel');
+  const waiting=document.getElementById('homeWaitingPanel');
+  const inbox=document.getElementById('homeBrainInboxPanel');
+  const recurring=document.getElementById('homeRecurringPanel');
+  const week=document.getElementById('homeWeekPanel');
+  const rhythm=document.getElementById('homeDailyRhythmPanel');
+  const close=document.getElementById('homeEveningPanel');
+  const anchor=brief||document.querySelector('.home-quick-actions');
+  let after=anchor;
+  [evening,weekly,today,needs,focus,health,projects,waiting,inbox,recurring,week,rhythm,close].filter(Boolean).forEach(node=>{after.insertAdjacentElement('afterend',node);after=node;});
+  document.querySelectorAll('.dashboard-grid').forEach(grid=>{if(!grid.children.length)grid.remove();});
+}
+function v53aInstallHomeControls(){
+  const state=getHomePanelStates();
+  document.querySelectorAll('.home-collapsible').forEach(panel=>{
+    const key=panel.dataset.homeSection;if(!key)return;
+    const heading=panel.querySelector(':scope > .section-heading,:scope > .focus-heading');if(!heading)return;
+    heading.classList.add('v53a-home-heading');
+    let controls=heading.querySelector(':scope > .home-heading-controls');
+    if(!controls){controls=document.createElement('div');controls.className='home-heading-controls';[...heading.children].filter(x=>x!==controls&&(x.matches('button')||x.classList.contains('section-actions'))).forEach(x=>controls.appendChild(x));heading.appendChild(controls);}
+    let button=controls.querySelector('.home-collapse-toggle');
+    if(!button){button=document.createElement('button');button.type='button';button.className='small-button secondary-button home-collapse-toggle';button.onclick=()=>toggleHomePanel(key);controls.appendChild(button);}
+    applyHomePanelState(panel,Boolean(state[key]));
+  });
+}
+
+const v53aGetTodayBase=getTodayReminderItems;
+getTodayReminderItems=function(){
+  const items=v53aGetTodayBase();
+  const today=recurringDate(localDateKey());
+  const recurring=(data.recurringTasks||[]).filter(t=>t.status!=='paused'&&t.nextDue&&recurringDate(t.nextDue)<=today).map(t=>({id:t.id,name:t.name,details:t.notes||'',source:'Recurring task',dueDate:t.nextDue,itemType:'recurring'}));
+  const keys=new Set(items.map(i=>`${i.itemType}:${i.id}`));
+  recurring.forEach(i=>{if(!keys.has(`recurring:${i.id}`))items.push(i);});
+  return items.sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+};
+const v53aOpenReminderBase=openReminderItem;
+openReminderItem=function(item){if(item?.itemType==='recurring')return openRecurringTaskDialog(item.id);return v53aOpenReminderBase(item);};
+const v53aCompletionBase=completionFor;
+completionFor=function(item){if(item?.itemType==='recurring')return()=>completeRecurringTask(item.id);return v53aCompletionBase(item);};
+
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');if(!area)return;area.innerHTML='';
+  const today=recurringDate(localDateKey());const tasks=(data.recurringTasks||[]).filter(t=>t.status!=='paused'&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!tasks.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  tasks.forEach(task=>{const st=recurringStatus(task);const row=makeV10Row({name:task.name,meta:`${recurringPatternLabel(task)} · ${st.label}`,dueDate:task.nextDue,action:()=>completeRecurringTask(task.id),open:()=>openRecurringTaskDialog(task.id)},{menu:compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();completeRecurringTask('${task.id}')">Complete</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button>`,task.name)});area.appendChild(row);});
+};
+
+function v53aAddCleaningRoomPicker(){
+  const label=document.getElementById('cleaningAreaLabel'),input=document.getElementById('cleaningRoom');if(!label||!input)return;
+  let select=document.getElementById('cleaningRoomPicker');
+  if(!select){select=document.createElement('select');select.id='cleaningRoomPicker';select.setAttribute('aria-label','Choose a previously used room or area');select.onchange=()=>{if(select.value){input.value=select.value;localStorage.setItem(V52F_ROOM_KEY,select.value);}};input.before(select);}
+  const rooms=v52fRoomNames();const current=input.value.trim();select.innerHTML='<option value="">Choose a saved room or type below</option>'+rooms.map(r=>`<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('');if(current&&rooms.includes(current))select.value=current;
+  label.classList.toggle('hidden',document.getElementById('itemType')?.value!=='cleaning');
+}
+const v53aUpdateFormBase=updateFormVisibility;
+updateFormVisibility=function(){v53aUpdateFormBase();v53aAddCleaningRoomPicker();};
+const v53aOpenCleaningBase=openCleaningDialog;
+openCleaningDialog=function(){v53aOpenCleaningBase();setTimeout(()=>{refreshCleaningRoomSuggestions();applyCleaningRoomDefault();v53aAddCleaningRoomPicker();},0);};
+const v53aEditCleaningBase=editCleaning;
+editCleaning=function(id){v53aEditCleaningBase(id);setTimeout(v53aAddCleaningRoomPicker,0);};
+
+// Project steps found through search or Lists open the editor; completion remains in the three-dot menu.
+renderProjects=function(){
+  const area=document.getElementById('projectsArea');if(!area)return;area.innerHTML='';const projects=Array.isArray(data.projects)?data.projects:[];
+  if(!projects.length){area.innerHTML='<div class="empty-state">No projects are saved yet.</div>';return;}
+  const openStates=getProjectStepStates();[...projects].sort(sortByDueDate).forEach(project=>{const steps=Array.isArray(project.steps)?project.steps:[];const complete=steps.length>0&&steps.every(s=>s.completed);project.completed=complete;const count=steps.filter(s=>s.completed).length;const row=document.createElement('div');row.className=`compact-manage-row project-compact-row ${complete?'completed-row':''}`;const actions=`<button onclick="closeAnchoredMenu();openAddDialog('step','${project.id}')">Add step</button><button onclick="closeAnchoredMenu();editProject('${project.id}')">Edit project</button><button onclick="closeAnchoredMenu();saveProjectAsTemplate('${project.id}')">Save as template</button><button class="danger-text" onclick="closeAnchoredMenu();deleteProject('${project.id}');refreshListsImmediately()">Delete project</button>`;row.innerHTML=`<button type="button" class="project-expand-button" onclick="toggleProjectSteps('${project.id}')" aria-expanded="${Boolean(openStates[project.id])}">${openStates[project.id]?'▾':'▸'}</button><button type="button" class="compact-row-main" onclick="toggleProjectSteps('${project.id}')"><span class="compact-row-title">${escapeHtml(project.name||'Untitled project')}</span><span class="compact-row-meta">${steps.length?`${count} of ${steps.length} steps`:'No steps'}</span></button>${compactMenu(actions,project.name||'project')}`;area.appendChild(row);const group=document.createElement('div');group.className='project-steps-group';group.dataset.projectId=project.id;group.hidden=!openStates[project.id];steps.forEach((step,index)=>{const sr=document.createElement('div');sr.className=`compact-manage-row nested-compact-row ${step.completed?'completed-row':''}`;const sa=`<button onclick="closeAnchoredMenu();editStep('${project.id}','${step.id}')">Edit step</button><button onclick="closeAnchoredMenu();toggleStep('${project.id}','${step.id}');refreshListsImmediately()">${step.completed?'Mark incomplete':'Complete step'}</button><button class="danger-text" onclick="closeAnchoredMenu();deleteStep('${project.id}','${step.id}');refreshListsImmediately()">Delete step</button>`;sr.innerHTML=`<button type="button" class="compact-row-main" onclick="editStep('${project.id}','${step.id}')"><span class="compact-row-title">${index+1}. ${escapeHtml(step.name||'Untitled step')}</span><span class="compact-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'} · Tap to edit</span></button>${compactMenu(sa,step.name||'project step')}`;group.appendChild(sr);});area.appendChild(group);});
+};
+
+function v53aLogOnce(type,name,meta={}){const log=typeof v52dRead==='function'?v52dRead(V52D_ACTIVITY_KEY,[]):[];const key=`${type}:${meta.itemId||meta.projectId||meta.parentId||name}:${localDateKey()}`;if(log.some(e=>e.dedupeKey===key))return;if(typeof v52dLog==='function')v52dLog(type,name,{...meta,dedupeKey:key});}
+const v53aToggleTodo=toggleTodo;toggleTodo=function(id){const item=data.todos.find(x=>String(x.id)===String(id)),was=Boolean(item?.completed);v53aToggleTodo(id);if(item&&!was&&item.completed){item.completedAt=new Date().toISOString();v53aLogOnce('todo',item.name,{itemId:id});saveData();}renderEveningReflection();};
+const v53aToggleTodoStep=toggleTodoStep;toggleTodoStep=function(todoId,stepId){const todo=data.todos.find(x=>String(x.id)===String(todoId)),step=todo?.steps?.find(x=>String(x.id)===String(stepId)),was=Boolean(step?.completed);v53aToggleTodoStep(todoId,stepId);if(step&&!was&&step.completed){step.completedAt=new Date().toISOString();v53aLogOnce('todoStep',step.name,{itemId:stepId,parentId:todoId});saveData();}renderEveningReflection();};
+const v53aToggleStep=toggleStep;toggleStep=function(projectId,stepId){const project=data.projects.find(x=>String(x.id)===String(projectId)),step=project?.steps?.find(x=>String(x.id)===String(stepId)),was=Boolean(step?.completed);v53aToggleStep(projectId,stepId);if(step&&!was&&step.completed){step.completedAt=new Date().toISOString();v53aLogOnce('projectStep',step.name,{itemId:stepId,projectId});saveData();}renderEveningReflection();};
+const v53aCompleteCleaning=completeCleaning;completeCleaning=function(id){const item=(data.cleaningTasks||[]).find(x=>String(x.id)===String(id));v53aCompleteCleaning(id);if(item)v53aLogOnce('cleaning',item.name,{itemId:id});renderEveningReflection();renderHiddenStatistics();};
+const v53aCompleteRecurring=completeRecurringTask;completeRecurringTask=function(id){const item=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));v53aCompleteRecurring(id);if(item)v53aLogOnce('recurring',item.name,{itemId:id});renderEveningReflection();renderHiddenStatistics();};
+const v53aCompleteWaiting=completeWaiting;completeWaiting=function(id){const item=(data.waiting||[]).find(x=>String(x.id)===String(id)),was=Boolean(item?.completed);v53aCompleteWaiting(id);if(item&&!was&&item.completed)v53aLogOnce('waiting',item.name,{itemId:id});renderEveningReflection();renderHiddenStatistics();};
+
+renderEveningReflection=function(){
+  const panel=document.getElementById('eveningReflectionPanel'),area=document.getElementById('eveningReflectionArea');if(!panel||!area)return;const now=new Date(),dismiss=v52dDismissals();if(now.getHours()<18||dismiss.evening===localDateKey()){panel.classList.add('hidden');return;}
+  const start=new Date();start.setHours(0,0,0,0);const events=v52dEventsSince(start);const completionTypes=['todo','todoStep','focus','projectStep','cleaning','recurring','waiting'];const completed=events.filter(e=>completionTypes.includes(e.type));const unique=[];const seen=new Set();completed.forEach(e=>{const k=e.dedupeKey||`${e.type}:${e.itemId||e.projectId||e.parentId||e.name}:${new Date(e.at).toISOString().slice(0,10)}`;if(!seen.has(k)){seen.add(k);unique.push(e);}});const total=unique.length;const tasks=unique.filter(e=>['todo','todoStep','focus','recurring','waiting'].includes(e.type)).length;const steps=unique.filter(e=>e.type==='projectStep').length;const cleaning=unique.filter(e=>e.type==='cleaning').length;const remaining=v52cActiveFocus().length+v52cUrgentItems().length+v52cDueRecurring().length;area.innerHTML=`<div class="reflection-summary"><p class="reflection-intro">A calm record from the same activity history used by Hidden Statistics.</p><div class="reflection-metrics">${v52dMetric(total,'everything completed')}${v52dMetric(tasks,'tasks and routines')}${v52dMetric(steps,'project steps')}${v52dMetric(cleaning,'cleaning jobs')}</div><div class="reflection-note">${escapeHtml(v52dGentleMessage(total,remaining))}</div>${remaining?`<div class="reflection-note"><strong>${remaining}</strong> item${remaining===1?'':'s'} remain visible for attention. They do not all have to be done tonight.</div>`:''}</div>`;panel.classList.remove('hidden');
+};
+
+function v53aResetRoutinesForNewDay(){const today=localDateKey();const previous=localStorage.getItem(V53A_ROUTINE_DATE_KEY);if(previous&&previous!==today){[...(data.dailyTasks||[]),...(data.eveningTasks||[])].forEach(task=>localStorage.removeItem(storageKey('daily',task.id)));}localStorage.setItem(V53A_ROUTINE_DATE_KEY,today);}
+
+function v53aRefresh(){v53aResetRoutinesForNewDay();v53aPlaceHomeSections();v53aInstallHomeControls();v53aAddCleaningRoomPicker();renderRecurringHome();renderTodayReminders();renderProjects();renderEveningReflection();renderHiddenStatistics();}
+const v53aRenderAllBase=renderAll;renderAll=function(){v53aRenderAllBase();v53aRefresh();};
+window.addEventListener('pageshow',v53aRefresh);document.addEventListener('DOMContentLoaded',v53aRefresh);setTimeout(v53aRefresh,0);
+
+
+/* ===== v53a patch 1: recurrence, routines, mobile consistency ===== */
+function resetRoutineGroup(group){
+  const label=group==='evening'?'Evening Routine':'Daily Rhythm';
+  if(!confirm(`Untick all ${label} items for today?`))return;
+  const tasks=group==='evening'?(data.eveningTasks||[]):(data.dailyTasks||[]);
+  tasks.forEach(task=>localStorage.removeItem(storageKey('daily',task.id)));
+  renderAll();showSaved(`${label} reset`);
+}
+
+const v53aPatchNormaliseAppointmentRepeat=normaliseAppointmentRepeat;
+normaliseAppointmentRepeat=function(a={}){
+  const r=v53aPatchNormaliseAppointmentRepeat(a);
+  r.monthlyMode=a.monthlyMode||a.repeatMonthlyMode||'date';
+  r.ordinal=Number(a.ordinal??a.repeatOrdinal??2);
+  r.weekday=Number(a.weekday??a.repeatWeekday??4);
+  return r;
+};
+
+const v53aPatchAdvanceAppointmentDate=advanceAppointmentDate;
+advanceAppointmentDate=function(date,rule){
+  if(rule.unit==='month'&&rule.monthlyMode==='nthWeekday'){
+    const base=new Date(date);const targetMonth=new Date(base.getFullYear(),base.getMonth()+Number(rule.interval||1),1,12);
+    return nthWeekdayOfMonth(targetMonth.getFullYear(),targetMonth.getMonth(),Number(rule.weekday),Number(rule.ordinal))||new Date(targetMonth.getFullYear(),targetMonth.getMonth()+1,0,12);
+  }
+  return v53aPatchAdvanceAppointmentDate(date,rule);
+};
+
+appointmentRepeatDescription=function(a){
+  const r=normaliseAppointmentRepeat(a);if(r.repeat==='none')return'';
+  let text;
+  if(r.unit==='month'&&r.monthlyMode==='nthWeekday'){
+    const ord={1:'first',2:'second',3:'third',4:'fourth','-1':'last'}[String(r.ordinal)]||'second';
+    const day=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][Number(r.weekday)||0];
+    text=Number(r.interval)===1?`every month on the ${ord} ${day}`:`every ${r.interval} months on the ${ord} ${day}`;
+  }else{
+    const unit=r.unit+(r.interval===1?'':'s');text=r.interval===1?`every ${unit}`:`every ${r.interval} ${unit}`;
+  }
+  if(r.endType==='count')text+=` · ${r.count} appointments`;else if(r.endType==='date'&&r.endDate)text+=` · until ${formatDate(r.endDate)}`;
+  return text;
+};
+
+const v53aPatchUpdateAppointmentRepeatControls=updateAppointmentRepeatControls;
+updateAppointmentRepeatControls=function(){
+  v53aPatchUpdateAppointmentRepeatControls();
+  const active=document.getElementById('appointmentRepeat')?.value!=='none';
+  const unit=document.getElementById('appointmentRepeatUnit')?.value;
+  const monthly=active&&unit==='month';
+  const mode=document.getElementById('appointmentMonthlyMode')?.value||'date';
+  const modeLabel=document.getElementById('appointmentMonthlyModeLabel');if(modeLabel)modeLabel.hidden=!monthly;
+  const ordinalLabel=document.getElementById('appointmentOrdinalLabel');if(ordinalLabel)ordinalLabel.hidden=!monthly||mode!=='nthWeekday';
+  const weekdayLabel=document.getElementById('appointmentWeekdayLabel');if(weekdayLabel)weekdayLabel.hidden=!monthly||mode!=='nthWeekday';
+  const summary=document.getElementById('appointmentRepeatSummary');
+  if(summary&&active)summary.textContent='Repeats '+appointmentRepeatDescription({repeat:document.getElementById('appointmentRepeat').value,repeatUnit:unit,repeatInterval:document.getElementById('appointmentRepeatInterval').value,repeatEndType:document.getElementById('appointmentRepeatEnd').value,repeatCount:document.getElementById('appointmentRepeatCount').value,repeatEndDate:document.getElementById('appointmentRepeatEndDate').value,monthlyMode:mode,ordinal:document.getElementById('appointmentOrdinal')?.value,weekday:document.getElementById('appointmentWeekday')?.value})+'.';
+};
+
+const v53aPatchOpenAppointmentDialog=openAppointmentDialog;
+openAppointmentDialog=function(id='',prefillName='',prefillNotes=''){
+  v53aPatchOpenAppointmentDialog(id,prefillName,prefillNotes);
+  const a=(data.appointments||[]).find(x=>String(x.id)===String(id));
+  const date=a?.date?dateOnly(a.date):new Date();
+  const mode=a?.monthlyMode||a?.repeatMonthlyMode||'date';
+  const ordinal=a?.ordinal??a?.repeatOrdinal??Math.ceil(date.getDate()/7);
+  const weekday=a?.weekday??a?.repeatWeekday??date.getDay();
+  const modeEl=document.getElementById('appointmentMonthlyMode');if(modeEl)modeEl.value=mode;
+  const ordEl=document.getElementById('appointmentOrdinal');if(ordEl)ordEl.value=String([1,2,3,4,-1].includes(Number(ordinal))?ordinal:2);
+  const dayEl=document.getElementById('appointmentWeekday');if(dayEl)dayEl.value=String(weekday);
+  updateAppointmentRepeatControls();
+};
+
+const v53aPatchSaveAppointment=saveAppointment;
+saveAppointment=function(){
+  const result=v53aPatchSaveAppointment();
+  if(result){
+    const id=document.getElementById('appointmentId')?.value;
+    // saveAppointment may close the dialog but values remain available.
+    const rec=(data.appointments||[]).find(x=>String(x.id)===String(id))||(data.appointments||[])[0];
+    if(rec&&rec.repeatUnit==='month'){
+      rec.monthlyMode=document.getElementById('appointmentMonthlyMode')?.value||'date';
+      rec.ordinal=rec.monthlyMode==='nthWeekday'?Number(document.getElementById('appointmentOrdinal')?.value||2):null;
+      rec.weekday=rec.monthlyMode==='nthWeekday'?Number(document.getElementById('appointmentWeekday')?.value||4):null;
+      saveData();renderAll();
+    }
+  }
+  return result;
+};
+
+// Make the recurring-task advanced rule conspicuous whenever Month(s) is selected.
+const v53aPatchUpdateRecurringRuleControls=updateRecurringRuleControls;
+updateRecurringRuleControls=function(){v53aPatchUpdateRecurringRuleControls();const help=document.querySelector('.recurring-monthly-help');if(help)help.hidden=document.getElementById('recurringTaskUnit')?.value!=='month';};
+
+
+/* ===== v53a Final Polish Patch ===== */
+function v53aPolishHomeHeaders(){
+  document.querySelectorAll('.home-collapsible').forEach(panel=>{
+    const heading=panel.querySelector(':scope > .section-heading,:scope > .focus-heading');
+    if(!heading)return;
+    let controls=heading.querySelector(':scope > .home-heading-controls');
+    if(!controls){
+      controls=document.createElement('div');
+      controls.className='home-heading-controls';
+      heading.appendChild(controls);
+    }
+    const info=heading.querySelector('.section-info-button');
+    if(info&&info.parentElement!==controls)controls.insertBefore(info,controls.firstChild);
+  });
+}
+
+function v53aResetListSearchView(){
+  const status=document.getElementById('listSearchStatus');
+  if(status)status.textContent='';
+  const projectStates=typeof getProjectStepStates==='function'?getProjectStepStates():{};
+  document.querySelectorAll('.managed-list-section').forEach(section=>{
+    section.hidden=false;
+    section.classList.remove('list-search-hidden');
+    section.querySelectorAll('.compact-manage-row,.annual-manage-row,.list-card,.v10-row,.custom-list-card,.custom-preview-item,.step-compact-row,.appointment-card').forEach(row=>{
+      row.hidden=false;
+      row.classList.remove('list-search-hidden');
+    });
+    section.querySelectorAll('.project-steps-group').forEach(group=>{
+      group.hidden=!projectStates[group.dataset.projectId];
+    });
+  });
+}
+
+const v53aFinalFilterMyLists=filterMyLists;
+filterMyLists=function(query=''){
+  const search=document.getElementById('globalListSearch');
+  const raw=String(query??search?.value??'');
+  if(!normaliseSearchText(raw)){
+    if(search&&search.value)search.value='';
+    v53aResetListSearchView();
+    return;
+  }
+  return v53aFinalFilterMyLists(raw);
+};
+
+function v53aInstallSearchReset(){
+  const search=document.getElementById('globalListSearch');
+  if(!search||search.dataset.finalResetReady==='true')return;
+  search.dataset.finalResetReady='true';
+  const sync=()=>{if(!normaliseSearchText(search.value))filterMyLists('');};
+  search.addEventListener('input',sync);
+  search.addEventListener('search',sync);
+  search.addEventListener('change',sync);
+  search.addEventListener('blur',sync);
+}
+
+function v53aFinalPolishRefresh(){
+  v53aPolishHomeHeaders();
+  v53aInstallSearchReset();
+  const search=document.getElementById('globalListSearch');
+  if(search&&!normaliseSearchText(search.value))v53aResetListSearchView();
+}
+const v53aFinalRenderAllBase=renderAll;
+renderAll=function(){v53aFinalRenderAllBase();requestAnimationFrame(v53aFinalPolishRefresh);};
+document.addEventListener('DOMContentLoaded',()=>setTimeout(v53aFinalPolishRefresh,0));
+window.addEventListener('pageshow',v53aFinalPolishRefresh);
+setTimeout(v53aFinalPolishRefresh,50);
+
+
+/* ===== v54b Project Templates ===== */
+const PROJECT_TEMPLATES_KEY='myLifePlannerProjectTemplates';
+function getProjectTemplates(){try{const value=JSON.parse(localStorage.getItem(PROJECT_TEMPLATES_KEY)||'[]');return Array.isArray(value)?value:[]}catch{return []}}
+function setProjectTemplates(items){localStorage.setItem(PROJECT_TEMPLATES_KEY,JSON.stringify(Array.isArray(items)?items:[]));}
+function templateStepLines(steps){return (steps||[]).map(step=>`${Number.isFinite(Number(step.daysBefore))?Number(step.daysBefore)+' | ':''}${step.name||''}`).join('\n');}
+function parseTemplateSteps(text){return String(text||'').split(/\n/).map(x=>x.trim()).filter(Boolean).map(line=>{const match=line.match(/^(\d+)\s*\|\s*(.+)$/);return match?{name:match[2].trim(),daysBefore:Number(match[1])}:{name:line,daysBefore:null};}).filter(x=>x.name);}
+function openProjectTemplates(){renderProjectTemplates();clearProjectTemplateForm();document.getElementById('projectTemplatesDialog')?.showModal();}
+function closeProjectTemplates(){document.getElementById('projectTemplatesDialog')?.close();}
+function clearProjectTemplateForm(){const f=document.getElementById('projectTemplateForm');if(f)f.reset();const id=document.getElementById('projectTemplateId');if(id)id.value='';const s=document.getElementById('projectTemplateEditorSummary');if(s)s.textContent='Create a template';}
+function renderProjectTemplates(){const area=document.getElementById('projectTemplatesList');if(!area)return;const items=getProjectTemplates();area.innerHTML='';if(!items.length){area.innerHTML='<div class="empty-state">No templates yet. Save an existing project as a template or create one below.</div>';return;}items.forEach(t=>{const row=document.createElement('div');row.className='template-card';row.innerHTML=`<div class="template-card-copy"><strong>${escapeHtml(t.name||'Untitled template')}</strong><span>${(t.steps||[]).length} steps${t.details?' · '+escapeHtml(t.details):''}</span></div><div class="template-card-actions"><button type="button" onclick="useProjectTemplate('${t.id}')">Use</button><button type="button" class="secondary-button" onclick="editProjectTemplate('${t.id}')">Edit</button><button type="button" class="secondary-button danger-text" onclick="deleteProjectTemplate('${t.id}')">Delete</button></div>`;area.appendChild(row);});}
+function saveProjectTemplate(event){event.preventDefault();const id=document.getElementById('projectTemplateId').value;const name=document.getElementById('projectTemplateName').value.trim();const details=document.getElementById('projectTemplateDetails').value.trim();const steps=parseTemplateSteps(document.getElementById('projectTemplateSteps').value);if(!name||!steps.length)return;const items=getProjectTemplates();const payload={id:id||uid(),name,details,steps,updatedAt:new Date().toISOString()};if(id){const i=items.findIndex(x=>String(x.id)===String(id));if(i>=0)items[i]={...items[i],...payload};else items.push(payload);}else items.push(payload);setProjectTemplates(items);clearProjectTemplateForm();renderProjectTemplates();}
+function editProjectTemplate(id){const t=getProjectTemplates().find(x=>String(x.id)===String(id));if(!t)return;document.getElementById('projectTemplateId').value=t.id;document.getElementById('projectTemplateName').value=t.name||'';document.getElementById('projectTemplateDetails').value=t.details||'';document.getElementById('projectTemplateSteps').value=templateStepLines(t.steps);document.getElementById('projectTemplateEditorSummary').textContent='Edit template';document.querySelector('.template-editor-details')?.setAttribute('open','');document.getElementById('projectTemplateName').focus();}
+function deleteProjectTemplate(id){if(!confirm('Delete this template? Existing projects will not be affected.'))return;setProjectTemplates(getProjectTemplates().filter(x=>String(x.id)!==String(id)));renderProjectTemplates();}
+function daysDiff(from,to){const a=dateOnly(from),b=dateOnly(to);return Math.round((b-a)/86400000);}
+function saveProjectAsTemplate(projectId){const project=(data.projects||[]).find(x=>String(x.id)===String(projectId));if(!project)return;const base=project.dueDate||null;const template={id:uid(),name:`${project.name} template`,details:project.details||'',steps:(project.steps||[]).map(s=>({name:s.name||'Untitled step',daysBefore:base&&s.dueDate?Math.max(0,daysDiff(s.dueDate,base)):null})),updatedAt:new Date().toISOString()};const items=getProjectTemplates();items.push(template);setProjectTemplates(items);openProjectTemplates();editProjectTemplate(template.id);}
+function dateMinusDays(value,days){if(!value||!Number.isFinite(Number(days)))return null;const d=dateOnly(value);d.setDate(d.getDate()-Number(days));return d.toISOString().slice(0,10);}
+function useProjectTemplate(id){const t=getProjectTemplates().find(x=>String(x.id)===String(id));if(!t)return;document.getElementById('projectTemplateUseId').value=t.id;document.getElementById('projectTemplateUseTitle').textContent=t.name||'Create project';document.getElementById('projectTemplateProjectName').value='';document.getElementById('projectTemplateDueDate').value='';document.getElementById('projectTemplateProjectDetails').value=t.details||'';renderProjectTemplatePreview(t);document.getElementById('projectTemplatesDialog')?.close();document.getElementById('projectTemplateUseDialog')?.showModal();document.getElementById('projectTemplateProjectName').focus();}
+function closeProjectTemplateUse(){document.getElementById('projectTemplateUseDialog')?.close();}
+function renderProjectTemplatePreview(template){const area=document.getElementById('projectTemplatePreview');if(!area)return;area.innerHTML=`<strong>Steps to create</strong><ol>${(template.steps||[]).map(s=>`<li>${escapeHtml(s.name)}${Number.isFinite(Number(s.daysBefore))?` <span>${Number(s.daysBefore)} days before due date</span>`:''}</li>`).join('')}</ol>`;}
+function createProjectFromTemplate(event){event.preventDefault();const t=getProjectTemplates().find(x=>String(x.id)===String(document.getElementById('projectTemplateUseId').value));if(!t)return;const name=document.getElementById('projectTemplateProjectName').value.trim();if(!name)return;const dueDate=document.getElementById('projectTemplateDueDate').value||null;const details=document.getElementById('projectTemplateProjectDetails').value.trim();const project={id:uid(),name,details,tags:[],timingType:dueDate?'date':'none',dueDate,leadDays:7,completed:false,createdAt:new Date().toISOString(),templateId:t.id,steps:(t.steps||[]).map((s,index)=>({id:uid(),name:s.name,details:'',timingType:dueDate&&Number.isFinite(Number(s.daysBefore))?'date':'none',dueDate:dueDate&&Number.isFinite(Number(s.daysBefore))?dateMinusDays(dueDate,s.daysBefore):null,leadDays:0,completed:false,order:index}))};data.projects.push(project);saveData();closeProjectTemplateUse();renderAll();refreshListsImmediately();showAppView('tasks');setTimeout(()=>document.getElementById('projectsListSection')?.scrollIntoView({behavior:'smooth',block:'start'}),50);}
+
+
+/* ===== v54b Smart Projects: dated steps in Timeline and mobile project management ===== */
+TIMELINE_TYPES.todoStep={icon:'☑️',label:'To-do step'};
+TIMELINE_TYPES.projectStep={icon:'📌',label:'Project step'};
+TIMELINE_TYPES.projectMilestone={icon:'🏁',label:'Project deadline'};
+
+function v54bTimelineItems(){
+  const today=new Date();today.setHours(0,0,0,0);
+  const items=[];
+  const add=(item)=>{
+    if(!item||!item.date)return;
+    const parsed=dateOnly(String(item.date).slice(0,10));
+    if(!parsed)return;
+    items.push({...item,date:localDateKey(parsed),name:String(item.name||'Untitled item')});
+  };
+  try{
+    (data.appointments||[]).forEach(a=>{
+      appointmentOccurrences(a,today,365).forEach(o=>add({id:a.id,type:'appointment',name:a.name||a.title,date:o.date,time:a.time||'',detail:[a.endTime&&a.time?`${a.time}–${a.endTime}`:a.time,a.location].filter(Boolean).join(' · '),open:()=>openAppointmentDialog(a.id)}));
+    });
+  }catch(error){console.warn('Timeline appointments skipped',error);}
+  (data.todos||[]).filter(x=>!x.completed).forEach(todo=>{
+    (todo.steps||[]).filter(step=>!step.completed&&step.dueDate).forEach(step=>add({
+      id:`${todo.id}:${step.id}`,type:'todoStep',name:step.name||'Untitled step',date:step.dueDate,
+      detail:`${todo.name||'To-do'}${step.details?' · '+step.details:''}`,
+      open:()=>editTodo(todo.id)
+    }));
+    const due=todo.dueDate||todo.date;
+    if(due)add({id:todo.id,type:'todo',name:todo.name||todo.title,date:due,detail:(todo.steps||[]).length?'Final deadline':(todo.details||todo.notes||''),open:()=>editTodo(todo.id)});
+  });
+  (data.projects||[]).filter(x=>!x.completed).forEach(project=>{
+    (project.steps||[]).filter(step=>!step.completed&&step.dueDate).forEach(step=>add({
+      id:`${project.id}:${step.id}`,type:'projectStep',name:step.name||'Untitled step',date:step.dueDate,
+      detail:`${project.name||'Project'}${step.details?' · '+step.details:''}`,
+      open:()=>editStep(project.id,step.id)
+    }));
+    const due=project.dueDate||project.targetDate||project.date;
+    if(due)add({id:project.id,type:'projectMilestone',name:project.name||project.title,date:due,detail:'Project deadline',open:()=>editProject(project.id)});
+  });
+  (data.cleaningTasks||[]).filter(x=>!x.completed&&(x.nextDue||x.dueDate||x.date)).forEach(x=>add({id:x.id,type:'cleaning',name:x.name||x.title,date:x.nextDue||x.dueDate||x.date,detail:x.room||x.area||'Home',open:()=>editCleaning(x.id)}));
+  (data.recurringTasks||[]).filter(x=>x.status!=='paused'&&x.nextDue).forEach(x=>add({id:x.id,type:'recurring',name:x.name||'Recurring task',date:x.nextDue,detail:recurringPatternLabel(x),open:()=>openRecurringTaskDialog(x.id)}));
+  (data.annualDates||[]).forEach(x=>{try{const d=nextAnnualOccurrence(String(x.monthDay||''));if(d)add({id:x.id,type:'annual',name:x.name||x.title,date:localDateKey(d),detail:x.details||x.notes||'',open:()=>editAnnual(x.id)});}catch(error){console.warn('Timeline annual date skipped',error);}});
+  (data.waiting||[]).filter(x=>!x.completed&&(x.reviewDate||x.dueDate||x.date)).forEach(x=>add({id:x.id,type:'waiting',name:x.name||x.title,date:x.reviewDate||x.dueDate||x.date,detail:x.note||x.details||'Review due',open:()=>editCapture('waiting',x.id)}));
+  return items.sort((a,b)=>`${a.date}${a.time||'99:99'}${a.name}`.localeCompare(`${b.date}${b.time||'99:99'}${b.name}`));
+}
+timelineItems=v54bTimelineItems;
+
+/* ===== v54q Project step reordering ===== */
+function moveProjectStep(projectId,stepId,direction){
+  const project=(data.projects||[]).find(p=>String(p.id)===String(projectId));
+  if(!project||!Array.isArray(project.steps))return;
+  const index=project.steps.findIndex(step=>String(step.id)===String(stepId));
+  if(index<0)return;
+  const target=index+(direction<0?-1:1);
+  if(target<0||target>=project.steps.length)return;
+  const [step]=project.steps.splice(index,1);
+  project.steps.splice(target,0,step);
+  project.updatedAt=new Date().toISOString();
+  saveData();
+  renderProjects();
+  renderProjectNextActions();
+  renderTodayReminders();
+  renderWeekly();
+  try{renderTimeline();}catch(error){console.error('Timeline could not refresh after project step reorder',error);}
+}
+
+renderProjects=function(){
+  const area=document.getElementById('projectsArea');if(!area)return;area.innerHTML='';
+  const projects=Array.isArray(data.projects)?data.projects:[];
+  if(!projects.length){area.innerHTML='<div class="empty-state">No projects are saved yet.</div>';return;}
+  const openStates=getProjectStepStates();
+  [...projects].sort(sortByDueDate).forEach(project=>{
+    const steps=Array.isArray(project.steps)?project.steps:[];
+    const genuinelyComplete=steps.length>0&&steps.every(step=>step.completed);project.completed=genuinelyComplete;
+    const completedCount=steps.filter(step=>step.completed).length;
+    const nextStep=steps.find(step=>!step.completed && !step.pending);
+    const hasIncomplete=steps.some(step=>!step.completed);
+    const nextMeta=nextStep?`Next: ${escapeHtml(nextStep.name||'Untitled step')}${nextStep.dueDate?' · '+formatDate(nextStep.dueDate):''}`:(hasIncomplete?'No active next step':(steps.length?'All steps complete':'No steps'));
+    const row=document.createElement('div');row.className=`compact-manage-row project-compact-row ${genuinelyComplete?'completed-row':''}`;
+    const projectActions=`<button onclick="closeAnchoredMenu();openAddDialog('step','${project.id}')">Add step</button><button onclick="closeAnchoredMenu();editProject('${project.id}')">Edit project</button><button onclick="closeAnchoredMenu();saveProjectAsTemplate('${project.id}')">Save as template</button><button class="danger-text" onclick="closeAnchoredMenu();deleteProject('${project.id}');refreshListsImmediately()">Delete project</button>`;
+    row.innerHTML=`<button type="button" class="project-expand-button" onclick="toggleProjectSteps('${project.id}')" aria-expanded="${Boolean(openStates[project.id])}" aria-label="${openStates[project.id]?'Hide':'Show'} steps">${openStates[project.id]?'▾':'▸'}</button><button type="button" class="compact-row-main" onclick="toggleProjectSteps('${project.id}')"><span class="compact-row-title">${escapeHtml(project.name||'Untitled project')}</span><span class="compact-row-meta">${steps.length?`${completedCount} of ${steps.length} steps`:'No steps'}${project.dueDate?' · Deadline '+formatDate(project.dueDate):''}</span><span class="compact-row-next">${nextMeta}</span></button>${compactMenu(projectActions,project.name||'project')}`;
+    area.appendChild(row);
+    const group=document.createElement('div');group.className='project-steps-group';group.dataset.projectId=project.id;group.hidden=!openStates[project.id];
+    steps.forEach((step,index)=>{
+      const sr=document.createElement('div');sr.className=`compact-manage-row nested-compact-row project-step-manage-row ${step.completed?'completed-row':''}`;
+      const sa=`<button onclick="closeAnchoredMenu();editStep('${project.id}','${step.id}')">Edit step</button>${index>0?`<button onclick="closeAnchoredMenu();moveProjectStep('${project.id}','${step.id}',-1)">Move up</button>`:''}${index<steps.length-1?`<button onclick="closeAnchoredMenu();moveProjectStep('${project.id}','${step.id}',1)">Move down</button>`:''}${!step.completed?`<button onclick="closeAnchoredMenu();toggleProjectStepPending('${project.id}','${step.id}')">${step.pending?'Mark active':'Mark pending'}</button>`:''}<button onclick="closeAnchoredMenu();toggleStep('${project.id}','${step.id}');refreshListsImmediately()">${step.completed?'Mark incomplete':'Complete step'}</button><button class="danger-text" onclick="closeAnchoredMenu();deleteStep('${project.id}','${step.id}');refreshListsImmediately()">Delete step</button>`;
+      const pendingLine=step.pending?`<span class="pending-status-line">Pending${step.pendingReason?' — '+escapeHtml(step.pendingReason):''}</span>`:'';
+      sr.innerHTML=`<button type="button" class="compact-row-main" onclick="editStep('${project.id}','${step.id}')"><span class="compact-row-title">${index+1}. ${escapeHtml(step.name||'Untitled step')}</span><span class="compact-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'} · Tap to edit</span>${pendingLine}</button>${compactMenu(sa,step.name||'project step')}`;
+      group.appendChild(sr);
+    });
+    area.appendChild(group);
+  });
+};
+
+
+/* ===== v54cR22 Recurring limits and expandable Home previews ===== */
+const V54C_HOME_INBOX_EXPANDED='myLifePlannerHomeInboxExpanded';
+const V54C_HOME_RECURRING_EXPANDED='myLifePlannerHomeRecurringExpanded';
+function v54cR22Bool(key){return localStorage.getItem(key)==='true';}
+function v54cR22SetBool(key,value){localStorage.setItem(key,String(Boolean(value)));}
+function v54cR22EndMode(task){return task?.endMode||'never';}
+function v54cR22EndingLabel(task){
+  if(v54cR22EndMode(task)==='date'&&task.endDate)return `Ends ${formatDate(task.endDate)}`;
+  if(v54cR22EndMode(task)==='count'&&Number(task.endCount)>0)return `${Number(task.completedOccurrences)||0} of ${Number(task.endCount)} occurrences completed`;
+  return '';
+}
+const v54cR22UpdateRecurringBase=updateRecurringRuleControls;
+updateRecurringRuleControls=function(){
+  v54cR22UpdateRecurringBase();
+  const mode=document.getElementById('recurringTaskEndMode')?.value||'never';
+  const dateLabel=document.getElementById('recurringEndDateLabel');
+  const countLabel=document.getElementById('recurringEndCountLabel');
+  if(dateLabel)dateLabel.hidden=mode!=='date';
+  if(countLabel)countLabel.hidden=mode!=='count';
+  const summary=document.getElementById('recurringRuleSummary');
+  if(summary){
+    let ending='';
+    if(mode==='date'){
+      const end=document.getElementById('recurringTaskEndDate')?.value;
+      ending=end?` It will stop after the final occurrence on or before ${formatDate(end)}.`:' Choose an end date.';
+    }else if(mode==='count'){
+      const count=Math.max(1,Number(document.getElementById('recurringTaskEndCount')?.value)||1);
+      ending=` It will stop after ${count} occurrence${count===1?'':'s'}.`;
+    }else ending=' It will continue until you pause or delete it.';
+    summary.textContent=(summary.textContent||'').replace(/ It will (stop|continue).*$/,'')+ending;
+  }
+};
+
+openRecurringTaskDialog=function(id=''){
+  const dialog=document.getElementById('recurringTaskDialog');if(!dialog)return;
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  document.getElementById('recurringTaskId').value=task?.id||'';
+  document.getElementById('recurringTaskName').value=task?.name||'';
+  document.getElementById('recurringTaskNotes').value=task?.notes||'';
+  document.getElementById('recurringTaskDueDate').value=task?.nextDue||localDateKey();
+  document.getElementById('recurringTaskInterval').value=task?.interval||1;
+  document.getElementById('recurringTaskUnit').value=task?.unit||'week';
+  document.getElementById('recurringTaskStatus').value=task?.status||'active';
+  document.getElementById('recurringMonthlyMode').value=task?.monthlyMode||'date';
+  document.getElementById('recurringOrdinal').value=String(task?.ordinal??2);
+  document.getElementById('recurringWeekday').value=String(task?.weekday??4);
+  document.getElementById('recurringTaskEndMode').value=v54cR22EndMode(task);
+  document.getElementById('recurringTaskEndDate').value=task?.endDate||'';
+  document.getElementById('recurringTaskEndCount').value=Math.max(1,Number(task?.endCount)||3);
+  document.getElementById('recurringTaskTags').value=tagsInputValue(task);
+  updateRecurringRuleControls();
+  document.getElementById('recurringTaskDialogTitle').textContent=task?'Edit recurring task':'New recurring task';
+  dialog.showModal();
+};
+
+saveRecurringTask=function(event){
+  event.preventDefault();
+  const id=document.getElementById('recurringTaskId').value;
+  const existing=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  const unit=document.getElementById('recurringTaskUnit').value;
+  const monthlyMode=unit==='month'?document.getElementById('recurringMonthlyMode').value:'date';
+  const endMode=document.getElementById('recurringTaskEndMode')?.value||'never';
+  const nextDue=document.getElementById('recurringTaskDueDate').value;
+  const endDate=endMode==='date'?(document.getElementById('recurringTaskEndDate')?.value||''):'';
+  const endCount=endMode==='count'?Math.max(1,Number(document.getElementById('recurringTaskEndCount')?.value)||1):null;
+  if(endMode==='date'&&(!endDate||dateOnly(endDate)<dateOnly(nextDue))){alert('Choose an end date on or after the first due date.');return;}
+  const task={
+    id:id||uid(),name:document.getElementById('recurringTaskName').value.trim(),notes:document.getElementById('recurringTaskNotes').value.trim(),tags:normaliseTags(document.getElementById('recurringTaskTags')?.value),nextDue,
+    interval:Math.max(1,Number(document.getElementById('recurringTaskInterval').value)||1),unit,monthlyMode,
+    ordinal:monthlyMode==='nthWeekday'?Number(document.getElementById('recurringOrdinal').value):null,
+    weekday:monthlyMode==='nthWeekday'?Number(document.getElementById('recurringWeekday').value):null,
+    status:document.getElementById('recurringTaskStatus').value,endMode,endDate,endCount,
+    completedOccurrences:Number(existing?.completedOccurrences)||0,createdAt:existing?.createdAt||new Date().toISOString(),lastCompleted:existing?.lastCompleted||''
+  };
+  if(!task.name||!task.nextDue)return;
+  if(existing)Object.assign(existing,task);else data.recurringTasks.push(task);
+  saveData();closeRecurringTaskDialog();renderAll();filterMyLists(document.getElementById('globalListSearch')?.value||'');
+};
+
+completeRecurringTask=function(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));if(!task||task.status==='completed')return;
+  const completedAt=new Date();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+  if(typeof v53aLogOnce==='function')v53aLogOnce('recurring',task.name,{itemId:id});else if(typeof v52dLog==='function')v52dLog('recurring',task.name,{itemId:id});
+  if(v54cR22EndMode(task)==='count'&&task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed';task.completedAt=completedAt.toISOString();saveData();renderAll();if(typeof renderEveningReflection==='function')renderEveningReflection();if(typeof renderHiddenStatistics==='function')renderHiddenStatistics();return;
+  }
+  let next=recurringDate(task.nextDue)||recurringDate(localDateKey());const today=recurringDate(localDateKey());
+  do{next=addRecurringInterval(next,task.unit,task.interval,task);}while(next<=today);
+  const nextKey=recurringDateKey(next);
+  if(v54cR22EndMode(task)==='date'&&task.endDate&&dateOnly(nextKey)>dateOnly(task.endDate)){
+    task.status='completed';task.completedAt=completedAt.toISOString();
+  }else{task.nextDue=nextKey;task.status='active';}
+  saveData();renderAll();if(typeof renderEveningReflection==='function')renderEveningReflection();if(typeof renderHiddenStatistics==='function')renderHiddenStatistics();
+};
+
+const v54cR22RecurringPatternBase=recurringPatternLabel;
+recurringPatternLabel=function(task){const base=v54cR22RecurringPatternBase(task);const ending=v54cR22EndingLabel(task);return ending?`${base} · ${ending}`:base;};
+const v54cR22RecurringStatusBase=recurringStatus;
+recurringStatus=function(task){if(task?.status==='completed')return{label:'Finished',className:'ongoing'};return v54cR22RecurringStatusBase(task);};
+
+function v54cR22PreviewButton(label,expanded,onclick){return `<button type="button" class="home-preview-toggle secondary-button" onclick="${onclick}">${expanded?'Show less':label}</button>`;}
+function toggleHomeInboxPreview(){v54cR22SetBool(V54C_HOME_INBOX_EXPANDED,!v54cR22Bool(V54C_HOME_INBOX_EXPANDED));renderInbox();}
+function toggleHomeRecurringPreview(){v54cR22SetBool(V54C_HOME_RECURRING_EXPANDED,!v54cR22Bool(V54C_HOME_RECURRING_EXPANDED));renderRecurringHome();}
+
+renderInbox=function(){
+  const full=document.getElementById('inboxArea'),preview=document.getElementById('inboxPreviewArea');
+  [full,preview].forEach(area=>{
+    if(!area)return;area.innerHTML='';
+    const fullSorted=[...(data.inbox||[])].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+    const activeOldest=fullSorted.filter(x=>x.status!=='processed').sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||''));
+    const expanded=v54cR22Bool(V54C_HOME_INBOX_EXPANDED);
+    const items=area===preview?(expanded?activeOldest:activeOldest.slice(0,3)):fullSorted;
+    if(!items.length){area.innerHTML='<div class="empty-state">Your Brain Inbox is clear.</div>';return;}
+    items.forEach(x=>{const processed=x.status==='processed';const row=makeV10Row({name:x.name,meta:inboxMeta(x),open:()=>editCapture('inbox',x.id)},{complete:false,menu:compactMenu(`<button onclick="closeAnchoredMenu();editCapture('inbox','${x.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleInboxProcessed('${x.id}')">${processed?'Mark as new':'Mark processed'}</button>${x.url?`<button onclick="closeAnchoredMenu();openBrainLink('${x.id}')">Open website</button>`:''}${x.attachment?`<button onclick="closeAnchoredMenu();openBrainAttachment('${x.id}')">Open attachment</button>`:''}<button onclick="closeAnchoredMenu();convertInbox('${x.id}','todo')">Make a to-do</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','project')">Make a project</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','appointment')">Make an appointment</button><button onclick="closeAnchoredMenu();convertInbox('${x.id}','waiting')">Move to Pending note</button><button class="danger-text" onclick="closeAnchoredMenu();deleteCapture('inbox','${x.id}')">Delete</button>`,x.name)});if(processed)row.classList.add('processed-inbox-row');area.appendChild(row);});
+    if(area===preview&&activeOldest.length>3){const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${activeOldest.length}`,expanded,'toggleHomeInboxPreview()');area.appendChild(wrap);}
+  });
+};
+
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');if(!area)return;area.innerHTML='';
+  const today=recurringDate(localDateKey());
+  const all=(data.recurringTasks||[]).filter(t=>t.status==='active'&&t.nextDue&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!all.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  const expanded=v54cR22Bool(V54C_HOME_RECURRING_EXPANDED),tasks=expanded?all:all.slice(0,3);
+  tasks.forEach(task=>{const st=recurringStatus(task);const row=makeV10Row({name:task.name,meta:`${recurringPatternLabel(task)} · ${st.label}`,dueDate:task.nextDue,action:()=>completeRecurringTask(task.id),open:()=>openRecurringTaskDialog(task.id)},{menu:compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();completeRecurringTask('${task.id}')">Complete</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button>`,task.name)});area.appendChild(row);});
+  if(all.length>3){const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${all.length}`,expanded,'toggleHomeRecurringPreview()');area.appendChild(wrap);}
+};
+
+const v54cR22WeeklyBase=getWeeklyItems;
+getWeeklyItems=function(){
+  const items=v54cR22WeeklyBase();const today=new Date();today.setHours(12,0,0,0);const end=new Date(today);end.setDate(end.getDate()+7);
+  const keys=new Set(items.map(i=>`${i.itemType}:${i.id}:${i.dueDate}`));
+  (data.recurringTasks||[]).filter(t=>t.status==='active'&&t.nextDue).forEach(t=>{
+    const due=dateOnly(t.nextDue);const key=`recurring:${t.id}:${t.nextDue}`;
+    if(due>today&&due<=end&&!keys.has(key)){items.push({id:t.id,name:t.name,details:t.notes||'',source:'Recurring task',dueDate:t.nextDue,itemType:'recurring',completed:false,leadDays:0});keys.add(key);}
+  });
+  return items.sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+};
+
+const v54cR22OpenReminderBase=openReminderItem;
+openReminderItem=function(item){if(item?.itemType==='recurring')return openRecurringTaskDialog(item.id);return v54cR22OpenReminderBase(item);};
+const v54cR22CompletionForBase=completionFor;
+completionFor=function(item){if(item?.itemType==='recurring')return()=>completeRecurringTask(item.id);return v54cR22CompletionForBase(item);};
+
+
+const v54cR22TimelineBase=timelineItems;
+timelineItems=function(){
+  const activeRecurring=new Set((data.recurringTasks||[]).filter(t=>t.status==='active').map(t=>String(t.id)));
+  return v54cR22TimelineBase().filter(item=>item.type!=='recurring'||activeRecurring.has(String(item.id)));
+};
+
+recurringTaskCard=function(task){
+  const status=recurringStatus(task),row=document.createElement('div');row.className='list-card recurring-task-card v10-row';
+  const finished=task.status==='completed';
+  row.innerHTML=`<div class="card-top"><div><div class="card-title">${escapeHtml(task.name)}</div><div class="card-meta">${escapeHtml(recurringPatternLabel(task))}${finished?'':` · Next due ${escapeHtml(formatDate(task.nextDue))}`}</div></div><span class="badge ${status.className}">${escapeHtml(status.label)}</span></div>${task.notes?`<div class="card-details">${escapeHtml(task.notes)}</div>`:''}${tagsMarkup(task)}<div class="card-actions"><button type="button" onclick="completeRecurringTask('${task.id}')" ${task.status!=='active'?'disabled':''}>Complete</button><button type="button" class="secondary-button" onclick="openRecurringTaskDialog('${task.id}')">Edit</button><button type="button" class="secondary-button" onclick="toggleRecurringPause('${task.id}')" ${finished?'disabled':''}>${task.status==='paused'?'Resume':'Pause'}</button><button type="button" class="danger-button" onclick="deleteRecurringTask('${task.id}')">Delete</button></div>`;
+  return row;
+};
+
+function v54cR22Refresh(){renderRecurringTasks();renderRecurringHome();renderInbox();renderWeekly();renderTodayReminders();renderTimeline();}
+setTimeout(v54cR22Refresh,80);
+
+
+/* ===== v54d recurring completion workflow hardening ===== */
+function v54dRefreshRecurringViews(){
+  try{renderTodayReminders();}catch(e){console.error('Today refresh failed',e);}
+  try{renderRecurringHome();}catch(e){console.error('Recurring Home refresh failed',e);}
+  try{renderRecurringTasks();}catch(e){console.error('Recurring Lists refresh failed',e);}
+  try{renderWeekly();}catch(e){console.error('This Week refresh failed',e);}
+  try{renderTimeline();}catch(e){console.error('Timeline refresh failed',e);}
+  try{renderEveningReflection();}catch(e){}
+  try{renderHiddenStatistics();}catch(e){}
+}
+
+completeRecurringTask=function(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!task||task.status!=='active')return;
+  const completedName=task.name||'Recurring task';
+  const completedAt=new Date();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+  if(typeof v53aLogOnce==='function')v53aLogOnce('recurring',completedName,{itemId:id});
+  else if(typeof v52dLog==='function')v52dLog('recurring',completedName,{itemId:id});
+
+  let finished=false;
+  if(v54cR22EndMode(task)==='count'&&task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed';
+    task.completedAt=completedAt.toISOString();
+    finished=true;
+  }else{
+    let next=recurringDate(task.nextDue)||recurringDate(localDateKey());
+    const today=recurringDate(localDateKey());
+    do{next=addRecurringInterval(next,task.unit,task.interval,task);}while(next<=today);
+    const nextKey=recurringDateKey(next);
+    if(v54cR22EndMode(task)==='date'&&task.endDate&&dateOnly(nextKey)>dateOnly(task.endDate)){
+      task.status='completed';
+      task.completedAt=completedAt.toISOString();
+      finished=true;
+    }else{
+      task.nextDue=nextKey;
+      task.status='active';
+    }
+  }
+
+  saveData();
+  // Re-render the whole application first, then explicitly refresh every time-based
+  // surface. This prevents the checkbox from remaining visually ticked after the
+  // occurrence has already advanced in storage.
+  renderAll();
+  requestAnimationFrame(v54dRefreshRecurringViews);
+
+  if(typeof showSaved==='function'){
+    if(finished)showSaved(`${completedName} complete · recurrence finished`);
+    else showSaved(`${completedName} complete · next due ${formatDate(task.nextDue)}`);
+  }
+};
+
+// Make the recurring completion control behave like the other completion circles.
+// The three-dot menu remains for management only.
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');if(!area)return;area.innerHTML='';
+  const today=recurringDate(localDateKey());
+  const all=(data.recurringTasks||[]).filter(t=>t.status==='active'&&t.nextDue&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!all.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  const expanded=v54cR22Bool(V54C_HOME_RECURRING_EXPANDED),tasks=expanded?all:all.slice(0,3);
+  tasks.forEach(task=>{
+    const st=recurringStatus(task);
+    const row=makeV10Row({name:task.name,meta:`${recurringPatternLabel(task)} · ${st.label}`,dueDate:task.nextDue,action:()=>completeRecurringTask(task.id),open:()=>openRecurringTaskDialog(task.id)},
+      {menu:compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button>`,task.name)});
+    area.appendChild(row);
+  });
+  if(all.length>3){const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${all.length}`,expanded,'toggleHomeRecurringPreview()');area.appendChild(wrap);}
+};
+
+// Harden the Today completion workflow for recurring items: use a button-style
+// completion circle rather than leaving a native checkbox checked while views refresh.
+const v54dCompactReminderBase=compactReminderRow;
+compactReminderRow=function(item,options={}){
+  if(item?.itemType!=='recurring'||!options.actionable)return v54dCompactReminderBase(item,options);
+  const row=document.createElement('div');
+  const overdue=item.dueDate&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+  row.className=`compact-reminder-row${options.clickable?' clickable-reminder':''}${overdue?' overdue-row':''}`;
+  const done=document.createElement('button');done.type='button';done.className='complete-dot compact-complete-dot';done.setAttribute('aria-label',`Complete ${item.name}`);done.setAttribute('title','Complete and advance recurrence');
+  done.onclick=event=>{event.stopPropagation();done.disabled=true;completeRecurringTask(item.id);};
+  const copy=document.createElement('div');copy.className='compact-copy';copy.innerHTML=`<strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(options.meta||'')}</span>`;
+  row.append(done,copy);
+  if(options.badge){const badge=document.createElement('span');badge.className='compact-badge';badge.textContent=options.badge;row.appendChild(badge);}
+  if(options.clickable){row.tabIndex=0;row.setAttribute('role','button');row.setAttribute('aria-label',`Open ${item.name}`);row.addEventListener('click',event=>{if(event.target.closest('button,input'))return;openReminderItem(item);});row.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openReminderItem(item);}});}
+  return row;
+};
+
+// Keep the preview controls visually light rather than full-width action buttons.
+v54cR22PreviewButton=function(label,expanded,onclick){return `<button type="button" class="home-preview-toggle secondary-button" onclick="${onclick}">${expanded?'Show less ↑':label+' ↓'}</button>`;};
+
+function v54dRefresh(){v54dRefreshRecurringViews();renderInbox();}
+setTimeout(v54dRefresh,100);
+
+
+/* ===== v54f recurring completion — single source of truth ===== */
+function v54fRecurringIsFinished(task){return task?.status==='completed';}
+function v54fAdvanceRecurringOccurrence(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!task||task.status!=='active')return {ok:false};
+  const completedName=task.name||'Recurring task';
+  const completedAt=new Date();
+  const completedDue=task.nextDue||localDateKey();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+
+  // One activity record for the completed occurrence.
+  if(typeof v53aLogOnce==='function')v53aLogOnce('recurring',completedName,{itemId:id,dueDate:completedDue});
+  else if(typeof v52dLog==='function')v52dLog('recurring',completedName,{itemId:id,dueDate:completedDue});
+
+  let finished=false;
+  const endMode=typeof v54cR22EndMode==='function'?v54cR22EndMode(task):(task.endMode||'never');
+  if(endMode==='count'&&task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+  }else{
+    let next=recurringDate(task.nextDue)||recurringDate(localDateKey());
+    const today=recurringDate(localDateKey());
+    // A completed occurrence can never remain due today/overdue. Always advance
+    // until the next occurrence is strictly after today.
+    do{next=addRecurringInterval(next,task.unit,task.interval,task);}while(next<=today);
+    const nextKey=recurringDateKey(next);
+    if(endMode==='date'&&task.endDate&&dateOnly(nextKey)>dateOnly(task.endDate)){
+      task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+    }else{
+      task.nextDue=nextKey;task.status='active';delete task.completedAt;
+    }
+  }
+  saveData();
+  // Re-render synchronously so the completed occurrence disappears immediately.
+  renderAll();
+  try{renderTodayReminders();}catch(_){}
+  try{renderRecurringHome();}catch(_){}
+  try{renderRecurringTasks();}catch(_){}
+  try{renderWeekly();}catch(_){}
+  try{renderTimeline();}catch(_){}
+  try{renderEveningReflection();}catch(_){}
+  try{renderHiddenStatistics();}catch(_){}
+  const result={ok:true,finished,nextDue:finished?'':task.nextDue,name:completedName};
+  if(typeof showSaved==='function')showSaved(finished?`${completedName} complete · recurrence finished`:`${completedName} complete · next due ${formatDate(task.nextDue)}`);
+  return result;
+}
+completeRecurringTask=function(id){return v54fAdvanceRecurringOccurrence(id);};
+
+// Today uses a dedicated recurring completion button instead of a checkbox. This
+// prevents an old checked control remaining on screen after the recurrence advances.
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;
+  const items=getTodayReminderItems();area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{
+    const overdue=item.itemType!=='annual'&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+    const meta=`${item.source} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    if(item.itemType==='recurring'){
+      const row=document.createElement('div');row.className=`compact-reminder-row clickable-reminder${overdue?' overdue-row':''}`;
+      const done=document.createElement('button');done.type='button';done.className='complete-dot compact-complete-dot recurring-complete-button';done.setAttribute('aria-label',`Complete ${item.name} and advance recurrence`);done.title='Complete and move to the next occurrence';
+      done.addEventListener('click',event=>{event.stopPropagation();if(done.disabled)return;done.disabled=true;v54fAdvanceRecurringOccurrence(item.id);});
+      const copy=document.createElement('div');copy.className='compact-copy';copy.innerHTML=`<strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(meta)}</span>`;
+      row.append(done,copy);row.tabIndex=0;row.setAttribute('role','button');row.setAttribute('aria-label',`Open ${item.name}`);
+      row.addEventListener('click',event=>{if(event.target.closest('button,input'))return;openRecurringTaskDialog(item.id);});
+      row.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openRecurringTaskDialog(item.id);}});
+      area.appendChild(row);return;
+    }
+    area.appendChild(compactReminderRow(item,{meta,actionable:item.itemType!=='annual',onComplete:completionFor(item),clickable:true}));
+  });
+};
+
+// Home recurring preview uses the same complete-and-advance action.
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');if(!area)return;area.innerHTML='';
+  const today=recurringDate(localDateKey());
+  const all=(data.recurringTasks||[]).filter(t=>t.status==='active'&&t.nextDue&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!all.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  const expanded=typeof v54cR22Bool==='function'?v54cR22Bool(V54C_HOME_RECURRING_EXPANDED):false;
+  const tasks=expanded?all:all.slice(0,3);
+  tasks.forEach(task=>{
+    const st=recurringStatus(task);
+    const row=makeV10Row({name:task.name,meta:`${recurringPatternLabel(task)} · ${st.label}`,dueDate:task.nextDue,action:()=>v54fAdvanceRecurringOccurrence(task.id),open:()=>openRecurringTaskDialog(task.id)},
+      {menu:compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button>`,task.name)});
+    area.appendChild(row);
+  });
+  if(all.length>3&&typeof v54cR22PreviewButton==='function'){
+    const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${all.length}`,expanded,'toggleHomeRecurringPreview()');area.appendChild(wrap);
+  }
+};
+
+setTimeout(()=>{try{renderTodayReminders();renderRecurringHome();}catch(e){console.error('v54f recurring refresh failed',e);}},120);
+
+
+/* ===== v54j recurring completion compatibility fix =====
+   Restored/backed-up recurring records from older releases may not have an
+   explicit status="active" field. Treat every non-paused/non-completed task as
+   active, normalise legacy records, and use one completion path everywhere.
+*/
+function v54jRecurringIsActive(task){
+  return Boolean(task)&&task.status!=='paused'&&task.status!=='completed';
+}
+function v54jNormaliseRecurringRecords(){
+  let changed=false;
+  (data.recurringTasks||[]).forEach(task=>{
+    if(!task||typeof task!=='object')return;
+    if(!task.status||!['active','paused','completed'].includes(task.status)){
+      task.status='active';changed=true;
+    }
+    if(!Number.isFinite(Number(task.completedOccurrences))){task.completedOccurrences=0;changed=true;}
+  });
+  if(changed)saveData();
+}
+function v54jAdvanceRecurringOccurrence(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!v54jRecurringIsActive(task))return {ok:false,reason:'inactive'};
+  if(task.status!=='active')task.status='active';
+  const completedName=task.name||'Recurring task';
+  const completedAt=new Date();
+  const completedDue=task.nextDue||localDateKey();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+  if(typeof v53aLogOnce==='function')v53aLogOnce('recurring',completedName,{itemId:id,dueDate:completedDue});
+  else if(typeof v52dLog==='function')v52dLog('recurring',completedName,{itemId:id,dueDate:completedDue});
+
+  let finished=false;
+  const endMode=typeof v54cR22EndMode==='function'?v54cR22EndMode(task):(task.endMode||'never');
+  if(endMode==='count'&&task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+  }else{
+    let next=recurringDate(task.nextDue)||recurringDate(localDateKey());
+    const today=recurringDate(localDateKey());
+    do{next=addRecurringInterval(next,task.unit||'week',Math.max(1,Number(task.interval)||1),task);}while(next<=today);
+    const nextKey=recurringDateKey(next);
+    if(endMode==='date'&&task.endDate&&dateOnly(nextKey)>dateOnly(task.endDate)){
+      task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+    }else{
+      task.nextDue=nextKey;task.status='active';delete task.completedAt;
+    }
+  }
+  saveData();
+  renderAll();
+  try{renderTodayReminders();}catch(_){}
+  try{renderRecurringHome();}catch(_){}
+  try{renderRecurringTasks();}catch(_){}
+  try{renderWeekly();}catch(_){}
+  try{renderTimeline();}catch(_){}
+  const result={ok:true,finished,nextDue:finished?'':task.nextDue,name:completedName};
+  if(typeof showSaved==='function')showSaved(finished?`${completedName} complete · recurrence finished`:`${completedName} complete · next due ${formatDate(task.nextDue)}`);
+  return result;
+}
+completeRecurringTask=function(id){return v54jAdvanceRecurringOccurrence(id);};
+
+// Include legacy/restored recurring records in time-based views even before the
+// normalisation pass has persisted status="active".
+const v54jTodayBase=getTodayReminderItems;
+getTodayReminderItems=function(){
+  const items=v54jTodayBase().filter(i=>i.itemType!=='recurring');
+  const today=recurringDate(localDateKey());
+  (data.recurringTasks||[]).filter(t=>v54jRecurringIsActive(t)&&t.nextDue&&recurringDate(t.nextDue)<=today).forEach(t=>items.push({id:t.id,name:t.name,details:t.notes||'',source:'Recurring task',dueDate:t.nextDue,itemType:'recurring'}));
+  return items.sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+};
+const v54jWeeklyBase=getWeeklyItems;
+getWeeklyItems=function(){
+  const items=v54jWeeklyBase().filter(i=>i.itemType!=='recurring');
+  const today=new Date();today.setHours(12,0,0,0);const end=new Date(today);end.setDate(end.getDate()+7);
+  (data.recurringTasks||[]).filter(t=>v54jRecurringIsActive(t)&&t.nextDue).forEach(t=>{
+    const due=dateOnly(t.nextDue);if(due>today&&due<=end)items.push({id:t.id,name:t.name,details:t.notes||'',source:'Recurring task',dueDate:t.nextDue,itemType:'recurring',completed:false,leadDays:0});
+  });
+  return items.sort((a,b)=>dateOnly(a.dueDate)-dateOnly(b.dueDate));
+};
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');if(!area)return;area.innerHTML='';
+  const today=recurringDate(localDateKey());
+  const all=(data.recurringTasks||[]).filter(t=>v54jRecurringIsActive(t)&&t.nextDue&&recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!all.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  const expanded=typeof v54cR22Bool==='function'?v54cR22Bool(V54C_HOME_RECURRING_EXPANDED):false;
+  const tasks=expanded?all:all.slice(0,3);
+  tasks.forEach(task=>{
+    const st=recurringStatus(task);
+    const row=makeV10Row({name:task.name,meta:`${recurringPatternLabel(task)} · ${st.label}`,dueDate:task.nextDue,action:()=>v54jAdvanceRecurringOccurrence(task.id),open:()=>openRecurringTaskDialog(task.id)},
+      {menu:compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button>`,task.name)});
+    area.appendChild(row);
+  });
+  if(all.length>3&&typeof v54cR22PreviewButton==='function'){
+    const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${all.length}`,expanded,'toggleHomeRecurringPreview()');area.appendChild(wrap);
+  }
+};
+// Reuse the normal completion circle in Today; it calls the robust completion path.
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;
+  const items=getTodayReminderItems();area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{
+    const overdue=item.itemType!=='annual'&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+    const meta=`${item.source} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    area.appendChild(compactReminderRow(item,{meta,actionable:item.itemType!=='annual',onComplete:item.itemType==='recurring'?()=>v54jAdvanceRecurringOccurrence(item.id):completionFor(item),clickable:true}));
+  });
+};
+v54jNormaliseRecurringRecords();
+setTimeout(()=>{try{renderTodayReminders();renderRecurringHome();renderWeekly();renderTimeline();}catch(e){console.error('v54j recurring compatibility refresh failed',e);}},120);
+
+/* ===== v54j hardening: protected Home management + recurring compatibility =====
+   Scope is deliberately narrow: preserve v54g recurrence compatibility and restore
+   Edit/Delete/Manage actions wherever a dated item is surfaced on Home.
+*/
+function v54jDeleteTodoStep(todoId,stepId){
+  const todo=(data.todos||[]).find(x=>String(x.id)===String(todoId));
+  if(!todo)return;
+  const step=(todo.steps||[]).find(x=>String(x.id)===String(stepId));
+  if(!step)return;
+  if(!confirm(`Delete step “${step.name||'Untitled step'}”?`))return;
+  todo.steps=(todo.steps||[]).filter(x=>String(x.id)!==String(stepId));
+  todo.completed=(todo.steps||[]).length>0&&todo.steps.every(s=>s.completed);
+  saveData();renderAll();
+}
+function v54jDeleteTodo(id){
+  const item=(data.todos||[]).find(x=>String(x.id)===String(id));
+  if(!item)return;
+  if(!confirm(`Delete “${item.name||'this to-do'}”?`))return;
+  deleteTodo(id);
+}
+function v54jDeleteProjectStep(projectId,stepId){
+  const project=(data.projects||[]).find(x=>String(x.id)===String(projectId));
+  const step=(project?.steps||[]).find(x=>String(x.id)===String(stepId));
+  if(!project||!step)return;
+  if(!confirm(`Delete step “${step.name||'Untitled step'}”?`))return;
+  deleteStep(projectId,stepId);
+}
+function v54jDeleteCleaning(id){
+  const item=(data.cleaningTasks||[]).find(x=>String(x.id)===String(id));
+  if(!item)return;
+  if(!confirm(`Delete cleaning task “${item.name||'this task'}”?`))return;
+  deleteCleaning(id);
+}
+function v54jDeleteAnnual(id){
+  const item=(data.annualDates||[]).find(x=>String(x.id)===String(id));
+  if(!item)return;
+  if(!confirm(`Delete “${item.name||'this annual date'}”?`))return;
+  deleteAnnual(id);
+}
+function v54jDeleteRecurring(id){
+  const item=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!item)return;
+  if(!confirm(`Delete recurring task “${item.name||'this task'}”?`))return;
+  deleteRecurringTask(id);
+}
+function v54jReminderMenu(item){
+  if(!item)return '';
+  const label=item.name||'item';
+  if(item.itemType==='todo')return compactMenu(`<button onclick="closeAnchoredMenu();editTodo('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteTodo('${item.id}')">Delete</button>`,label);
+  if(item.itemType==='todoStep')return compactMenu(`<button onclick="closeAnchoredMenu();editTodo('${item.parentId}')">Edit to-do</button><button onclick="closeAnchoredMenu();toggleTodoStep('${item.parentId}','${item.id}')">${item.completed?'Mark active':'Complete step'}</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteTodoStep('${item.parentId}','${item.id}')">Delete step</button>`,label);
+  if(item.itemType==='step')return compactMenu(`<button onclick="closeAnchoredMenu();editStep('${item.parentId}','${item.id}')">Edit step</button><button onclick="closeAnchoredMenu();toggleStep('${item.parentId}','${item.id}')">${item.completed?'Mark active':'Complete step'}</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteProjectStep('${item.parentId}','${item.id}')">Delete step</button>`,label);
+  if(item.itemType==='cleaning')return compactMenu(`<button onclick="closeAnchoredMenu();editCleaning('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteCleaning('${item.id}')">Delete</button>`,label);
+  if(item.itemType==='appointment')return compactMenu(`<button onclick="closeAnchoredMenu();openAppointmentDialog('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();deleteAppointment('${item.id}')">Delete</button>`,label);
+  if(item.itemType==='annual'||item.annual)return compactMenu(`<button onclick="closeAnchoredMenu();editAnnual('${item.id}')">Edit</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteAnnual('${item.id}')">Delete</button>`,label);
+  if(item.itemType==='recurring')return compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${item.id}')">Edit</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${item.id}')">Pause</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteRecurring('${item.id}')">Delete</button>`,label);
+  if(item.itemType==='project')return compactMenu(`<button onclick="closeAnchoredMenu();editProject('${item.id}')">Manage</button><button class="danger-text" onclick="closeAnchoredMenu();deleteProject('${item.id}')">Delete project</button>`,label);
+  return '';
+}
+function v54jReminderRow(item,meta){
+  const row=compactReminderRow(item,{meta,actionable:item.itemType!=='annual',onComplete:item.itemType==='recurring'?()=>v54jAdvanceRecurringOccurrence(item.id):completionFor(item),clickable:true});
+  const menu=v54jReminderMenu(item);
+  if(menu)row.insertAdjacentHTML('beforeend',menu);
+  return row;
+}
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;
+  const items=getTodayReminderItems();area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{
+    const overdue=item.itemType!=='annual'&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+    const meta=`${item.source} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    area.appendChild(v54jReminderRow(item,meta));
+  });
+};
+renderWeekly=function(){
+  const area=document.getElementById('weeklyArea'),items=getWeeklyItems();if(!area)return;area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing needs attention this week.</div>';return;}
+  let current='';
+  items.forEach(item=>{
+    const key=String(item.dueDate||'').slice(0,10);
+    if(key!==current){current=key;const h=document.createElement('h3');h.className='timeline-date-heading home-week-date-heading';h.textContent=formatDate(key);area.appendChild(h);}
+    area.appendChild(v54jReminderRow(item,item.source||''));
+  });
+};
+// Normalize restored/legacy recurring records before any protected Home view is drawn.
+v54jNormaliseRecurringRecords();
+setTimeout(()=>{try{renderTodayReminders();renderWeekly();renderRecurringHome();}catch(e){console.error('v54j hardening refresh failed',e);}},150);
+
+
+/* ===== v54j hardening correction =====
+   v54j accidentally called two v54g-only symbol names at the end of the file.
+   That ReferenceError stopped the final protected Home refresh from running, so
+   older Home rows stayed on screen without their management menus/handlers.
+*/
+setTimeout(()=>{
+  try{
+    v54jNormaliseRecurringRecords();
+    renderTodayReminders();
+    renderWeekly();
+    renderRecurringHome();
+    renderInbox();
+    renderWaiting();
+  }catch(error){console.error('v54j protected workflow refresh failed',error);}
+},180);
+
+
+/* ===== v54j recurring interaction fix =====
+   The shared generic row controls have been overridden several times across releases.
+   Recurring completion now uses a dedicated button in both Home surfaces so the
+   tap/click path is explicit and independent of generic checkbox/row behaviour.
+*/
+function v54jRunRecurringCompletion(id, control){
+  if(control && control.dataset.busy==='1') return;
+  if(control){ control.dataset.busy='1'; control.setAttribute('aria-busy','true'); }
+  try{
+    const result=v54jAdvanceRecurringOccurrence(id);
+    if(!result?.ok && typeof showSaved==='function') showSaved('Could not complete recurring task');
+  }catch(error){
+    console.error('v54j recurring completion failed',error);
+    if(typeof showSaved==='function') showSaved('Recurring task could not be completed');
+  }finally{
+    if(control){ control.dataset.busy='0'; control.removeAttribute('aria-busy'); }
+  }
+}
+function v54jAdvanceRecurringOccurrence(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!task || task.status==='paused' || task.status==='completed') return {ok:false,reason:'inactive'};
+  if(task.status!=='active') task.status='active';
+  const completedName=task.name||'Recurring task';
+  const completedAt=new Date();
+  const completedDue=task.nextDue||localDateKey();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+  if(typeof v53aLogOnce==='function') v53aLogOnce('recurring',completedName,{itemId:id,dueDate:completedDue});
+  else if(typeof v52dLog==='function') v52dLog('recurring',completedName,{itemId:id,dueDate:completedDue});
+
+  let finished=false;
+  const endMode=typeof v54cR22EndMode==='function'?v54cR22EndMode(task):(task.endMode||'never');
+  if(endMode==='count' && task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed'; task.completedAt=completedAt.toISOString(); finished=true;
+  }else{
+    let next=recurringDate(task.nextDue)||recurringDate(localDateKey());
+    const today=recurringDate(localDateKey());
+    let guard=0;
+    do{
+      next=addRecurringInterval(next,task.unit||'week',Math.max(1,Number(task.interval)||1),task);
+      guard++;
+      if(guard>400) throw new Error('Recurring date failed to advance');
+    }while(next<=today);
+    const nextKey=recurringDateKey(next);
+    if(endMode==='date' && task.endDate && dateOnly(nextKey)>dateOnly(task.endDate)){
+      task.status='completed'; task.completedAt=completedAt.toISOString(); finished=true;
+    }else{
+      task.nextDue=nextKey; task.status='active'; delete task.completedAt;
+    }
+  }
+  saveData();
+  // Redraw from saved data. No checked control is left behind.
+  renderAll();
+  try{renderTodayReminders();}catch(error){console.error(error);}
+  try{renderRecurringHome();}catch(error){console.error(error);}
+  try{renderRecurringTasks();}catch(error){console.error(error);}
+  try{renderWeekly();}catch(error){console.error(error);}
+  try{renderTimeline();}catch(error){console.error(error);}
+  if(typeof showSaved==='function') showSaved(finished?`${completedName} complete · recurrence finished`:`${completedName} complete · next due ${formatDate(task.nextDue)}`);
+  return {ok:true,finished,nextDue:finished?'':task.nextDue,name:completedName};
+}
+completeRecurringTask=function(id){ return v54jAdvanceRecurringOccurrence(id); };
+
+function v54jRecurringCompleteButton(task){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='complete-dot recurring-complete-button v54j-recurring-complete';
+  button.setAttribute('aria-label',`Complete ${task.name||'recurring task'} and advance to next date`);
+  button.title='Complete this occurrence';
+  button.addEventListener('click',event=>{ event.preventDefault(); event.stopPropagation(); v54jRunRecurringCompletion(task.id,button); });
+  return button;
+}
+function v54jRecurringHomeRow(task){
+  const st=recurringStatus(task);
+  const row=document.createElement('div');
+  row.className=`v10-row ${dueClass(task.nextDue)}`;
+  const done=v54jRecurringCompleteButton(task);
+  const main=document.createElement('button');
+  main.type='button'; main.className='v10-row-main';
+  main.innerHTML=`<span class="v10-row-title">${escapeHtml(task.name||'Recurring task')}</span><span class="v10-row-meta">${escapeHtml(`${recurringPatternLabel(task)} · ${st.label}`)}</span>`;
+  main.addEventListener('click',()=>openRecurringTaskDialog(task.id));
+  row.append(done,main);
+  row.insertAdjacentHTML('beforeend',compactMenu(`<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${task.id}')">Edit</button><button onclick="closeAnchoredMenu();v54jRunRecurringCompletion('${task.id}')">Complete</button><button onclick="closeAnchoredMenu();toggleRecurringPause('${task.id}')">Pause</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteRecurring('${task.id}')">Delete</button>`,task.name||'Recurring task'));
+  return row;
+}
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea'); if(!area)return; area.innerHTML='';
+  const today=recurringDate(localDateKey());
+  const all=(data.recurringTasks||[]).filter(t=>t && t.status!=='paused' && t.status!=='completed' && t.nextDue && recurringDate(t.nextDue)<=today).sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  if(!all.length){area.innerHTML='<div class="empty-state">No recurring responsibilities are due.</div>';return;}
+  const expanded=typeof v54cR22Bool==='function'?v54cR22Bool(V54C_HOME_RECURRING_EXPANDED):false;
+  const tasks=expanded?all:all.slice(0,3);
+  tasks.forEach(task=>area.appendChild(v54jRecurringHomeRow(task)));
+  if(all.length>3 && typeof v54cR22PreviewButton==='function'){
+    const wrap=document.createElement('div');wrap.className='home-preview-actions';wrap.innerHTML=v54cR22PreviewButton(`Show all ${all.length}`,expanded,'toggleHomeRecurringPreview()');area.appendChild(wrap);
+  }
+};
+
+function v54jTodayRecurringRow(item,meta){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(item.id))||item;
+  const overdue=item.dueDate && dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+  const row=document.createElement('div');
+  row.className=`compact-reminder-row clickable-reminder${overdue?' overdue-row':''}`;
+  const done=v54jRecurringCompleteButton(task);
+  done.classList.add('compact-complete-dot');
+  const copy=document.createElement('div');copy.className='compact-copy';copy.innerHTML=`<strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(meta||'')}</span>`;
+  row.append(done,copy);
+  const menu=v54jReminderMenu({...item,itemType:'recurring'});
+  if(menu) row.insertAdjacentHTML('beforeend',menu.replace('>Pause<','>Pause<').replace('</button><button class="danger-text"',`</button><button onclick="closeAnchoredMenu();v54jRunRecurringCompletion('${item.id}')">Complete</button><button class="danger-text"`));
+  row.tabIndex=0;row.setAttribute('role','button');row.setAttribute('aria-label',`Open ${item.name}`);
+  row.addEventListener('click',event=>{if(event.target.closest('button,input,summary'))return;openRecurringTaskDialog(item.id);});
+  row.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openRecurringTaskDialog(item.id);}});
+  return row;
+}
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;
+  const items=getTodayReminderItems();area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{
+    const overdue=item.itemType!=='annual'&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+    const meta=`${item.source} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    if(item.itemType==='recurring') area.appendChild(v54jTodayRecurringRow(item,meta));
+    else area.appendChild(v54jReminderRow(item,meta));
+  });
+};
+
+try{v54jNormaliseRecurringRecords();}catch(_){}
+setTimeout(()=>{try{renderTodayReminders();renderRecurringHome();renderWeekly();renderTimeline();}catch(error){console.error('v54j recurring interaction refresh failed',error);}},200);
+
+/* ===== v54m canonical recurring advance fix =====
+   Protected workflow: completing a recurring occurrence MUST either finish the
+   recurrence or move nextDue strictly beyond today's date. Legacy unit labels
+   from restored backups are normalised here so an unrecognised unit can never
+   leave nextDue unchanged and strand the task in Today.
+*/
+function v54mRecurringUnit(value){
+  const raw=String(value||'week').trim().toLowerCase();
+  const map={day:'day',days:'day',daily:'day',week:'week',weeks:'week',weekly:'week',month:'month',months:'month',monthly:'month',year:'year',years:'year',yearly:'year',annually:'year',annual:'year'};
+  return map[raw]||'week';
+}
+function v54mNextRecurringDate(task,fromDate){
+  const unit=v54mRecurringUnit(task?.unit);
+  const interval=Math.max(1,Number(task?.interval)||1);
+  let next=addRecurringInterval(new Date(fromDate),unit,interval,task||{});
+  // Hard safety: the next date must move forwards. If legacy data causes the
+  // shared helper to return the same date, use a deterministic fallback.
+  if(!(next instanceof Date)||Number.isNaN(next.getTime())||next<=fromDate){
+    next=new Date(fromDate);
+    if(unit==='day') next.setDate(next.getDate()+interval);
+    else if(unit==='week') next.setDate(next.getDate()+(7*interval));
+    else if(unit==='month') next.setMonth(next.getMonth()+interval);
+    else next.setFullYear(next.getFullYear()+interval);
+  }
+  return next;
+}
+function v54mAdvanceRecurringOccurrence(id){
+  const task=(data.recurringTasks||[]).find(x=>String(x.id)===String(id));
+  if(!task||task.status==='paused'||task.status==='completed')return {ok:false,reason:'inactive'};
+  task.status='active';
+  task.unit=v54mRecurringUnit(task.unit);
+  const completedName=task.name||'Recurring task';
+  const completedAt=new Date();
+  const completedDue=task.nextDue||localDateKey();
+  task.lastCompleted=completedAt.toISOString();
+  task.completedOccurrences=(Number(task.completedOccurrences)||0)+1;
+  if(typeof v53aLogOnce==='function')v53aLogOnce('recurring',completedName,{itemId:id,dueDate:completedDue});
+  else if(typeof v52dLog==='function')v52dLog('recurring',completedName,{itemId:id,dueDate:completedDue});
+
+  let finished=false;
+  const endMode=typeof v54cR22EndMode==='function'?v54cR22EndMode(task):(task.endMode||'never');
+  if(endMode==='count'&&task.completedOccurrences>=Math.max(1,Number(task.endCount)||1)){
+    task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+  }else{
+    let next=recurringDate(task.nextDue)||recurringDate(localDateKey());
+    const today=recurringDate(localDateKey());
+    let guard=0;
+    do{
+      const before=new Date(next);
+      next=v54mNextRecurringDate(task,before);
+      guard++;
+      if(guard>400)throw new Error('Recurring date failed to advance');
+    }while(next<=today);
+    const nextKey=recurringDateKey(next);
+    if(endMode==='date'&&task.endDate&&dateOnly(nextKey)>dateOnly(task.endDate)){
+      task.status='completed';task.completedAt=completedAt.toISOString();finished=true;
+    }else{
+      task.nextDue=nextKey;task.status='active';delete task.completedAt;
+    }
+  }
+  saveData();
+  // Refresh only after persisted nextDue/status is final.
+  renderAll();
+  try{renderTodayReminders();}catch(error){console.error('v54m Today refresh',error);}
+  try{renderRecurringHome();}catch(error){console.error('v54m recurring Home refresh',error);}
+  try{renderRecurringTasks();}catch(error){console.error('v54m recurring Lists refresh',error);}
+  try{renderWeekly();}catch(error){console.error('v54m This Week refresh',error);}
+  try{renderTimeline();}catch(error){console.error('v54m Timeline refresh',error);}
+  if(typeof showSaved==='function')showSaved(finished?`${completedName} complete · recurrence finished`:`${completedName} complete · next due ${formatDate(task.nextDue)}`);
+  return {ok:true,finished,nextDue:finished?'':task.nextDue,name:completedName};
+}
+v54jAdvanceRecurringOccurrence=v54mAdvanceRecurringOccurrence;
+completeRecurringTask=v54mAdvanceRecurringOccurrence;
+// Normalise legacy unit names once at startup without changing valid schedules.
+try{
+  let changed=false;
+  (data.recurringTasks||[]).forEach(task=>{const unit=v54mRecurringUnit(task.unit);if(task.unit!==unit){task.unit=unit;changed=true;}});
+  if(changed)saveData();
+}catch(error){console.error('v54m recurrence normalisation',error);}
+
+
+/* ===== v54r Undo / Mark Incomplete — Project Steps only ===== */
+function v54rRemoveProjectStepCompletionLog(projectId, stepId, stepName){
+  if(typeof v52dRead!=='function' || typeof v52dWrite!=='function') return;
+  const log=v52dRead(V52D_ACTIVITY_KEY,[]);
+  const filtered=log.filter(event=>{
+    if(event?.type!=='projectStep') return true;
+    if(event.itemId!=null && String(event.itemId)===String(stepId)) return false;
+    // Compatibility with older project-step activity records that pre-date itemId.
+    if(event.itemId==null && String(event.projectId||'')===String(projectId) && String(event.name||'')===String(stepName||'')) return false;
+    return true;
+  });
+  if(filtered.length!==log.length) v52dWrite(V52D_ACTIVITY_KEY,filtered);
+}
+const v54rToggleStepBase=toggleStep;
+toggleStep=function(projectId,stepId){
+  const project=(data.projects||[]).find(item=>String(item.id)===String(projectId));
+  const step=project?.steps?.find(item=>String(item.id)===String(stepId));
+  const wasComplete=Boolean(step?.completed);
+  v54rToggleStepBase(projectId,stepId);
+  if(step && wasComplete && !step.completed){
+    step.completedAt=null;
+    v54rRemoveProjectStepCompletionLog(projectId,stepId,step.name);
+    saveData();
+    if(typeof renderEveningReflection==='function') renderEveningReflection();
+    if(typeof renderHiddenStatistics==='function') renderHiddenStatistics();
+  }
+};
+
+
+/* ===== v54s Undo / Mark Incomplete — Ordinary To-dos only =====
+   Scope: to-dos and their steps. Recurring tasks remain deliberately untouched. */
+function v54sRemoveTodoCompletionLog(type, itemId, parentId, itemName){
+  if(typeof v52dRead!=='function' || typeof v52dWrite!=='function') return;
+  const log=v52dRead(V52D_ACTIVITY_KEY,[]);
+  const filtered=log.filter(event=>{
+    if(event?.type!==type) return true;
+    if(event.itemId!=null && String(event.itemId)===String(itemId)) return false;
+    // Compatibility with older records that may not contain itemId.
+    if(event.itemId==null && type==='todoStep' && String(event.parentId||'')===String(parentId||'') && String(event.name||'')===String(itemName||'')) return false;
+    if(event.itemId==null && type==='todo' && String(event.name||'')===String(itemName||'')) return false;
+    return true;
+  });
+  if(filtered.length!==log.length) v52dWrite(V52D_ACTIVITY_KEY,filtered);
+}
+const v54sToggleTodoBase=toggleTodo;
+toggleTodo=function(id){
+  const item=(data.todos||[]).find(todo=>String(todo.id)===String(id));
+  const wasComplete=Boolean(item?.completed);
+  v54sToggleTodoBase(id);
+  if(item && wasComplete && !item.completed){
+    item.completedAt=null;
+    v54sRemoveTodoCompletionLog('todo',id,'',item.name);
+    saveData();
+    if(typeof renderEveningReflection==='function') renderEveningReflection();
+    if(typeof renderHiddenStatistics==='function') renderHiddenStatistics();
+  }
+};
+const v54sToggleTodoStepBase=toggleTodoStep;
+toggleTodoStep=function(todoId,stepId){
+  const todo=(data.todos||[]).find(item=>String(item.id)===String(todoId));
+  const step=todo?.steps?.find(item=>String(item.id)===String(stepId));
+  const wasComplete=Boolean(step?.completed);
+  v54sToggleTodoStepBase(todoId,stepId);
+  if(step && wasComplete && !step.completed){
+    step.completedAt=null;
+    v54sRemoveTodoCompletionLog('todoStep',stepId,todoId,step.name);
+    saveData();
+    if(typeof renderEveningReflection==='function') renderEveningReflection();
+    if(typeof renderHiddenStatistics==='function') renderHiddenStatistics();
+  }
+};
+
+/* ===== v54u Recurring-task Undo / Mark Incomplete =====
+   Scope: one-level undo of the most recent recurring completion made in v54u.
+   Completion itself continues to use the protected v54m advance path. */
+function v54uRemoveRecurringCompletionLog(taskId, dueDate, completedAt){
+  if(typeof v52dRead!=='function' || typeof v52dWrite!=='function') return;
+  const log=v52dRead(V52D_ACTIVITY_KEY,[]);
+  let removeIndex=-1;
+  for(let index=log.length-1;index>=0;index--){
+    const event=log[index];
+    if(event?.type!=='recurring') continue;
+    if(event.itemId==null || String(event.itemId)!==String(taskId)) continue;
+    if(event.dueDate && dueDate && String(event.dueDate)!==String(dueDate)) continue;
+    // Prefer the record created by this completion. The due-date match keeps
+    // compatibility with records written before exact completion timestamps.
+    if(completedAt && event.at && Math.abs(new Date(event.at)-new Date(completedAt))>120000) continue;
+    removeIndex=index;break;
+  }
+  if(removeIndex>=0){log.splice(removeIndex,1);v52dWrite(V52D_ACTIVITY_KEY,log);}
+}
+const v54uAdvanceRecurringBase=v54mAdvanceRecurringOccurrence;
+function v54uAdvanceRecurringOccurrence(id){
+  const task=(data.recurringTasks||[]).find(item=>String(item.id)===String(id));
+  if(!task || task.status==='paused' || task.status==='completed') return {ok:false,reason:'inactive'};
+  const before={
+    nextDue:task.nextDue||localDateKey(),
+    status:task.status||'active',
+    completedOccurrences:Number(task.completedOccurrences)||0,
+    lastCompleted:task.lastCompleted||'',
+    hadCompletedAt:Object.prototype.hasOwnProperty.call(task,'completedAt'),
+    completedAt:task.completedAt??null
+  };
+  const result=v54uAdvanceRecurringBase(id);
+  if(result?.ok){
+    task.v54uUndoLastCompletion={...before,completionAt:task.lastCompleted||new Date().toISOString()};
+    saveData();
+    try{renderRecurringTasks();}catch(error){console.error('v54u recurring Lists refresh',error);}
+  }
+  return result;
+}
+function undoLastRecurringCompletion(id){
+  const task=(data.recurringTasks||[]).find(item=>String(item.id)===String(id));
+  const snapshot=task?.v54uUndoLastCompletion;
+  if(!task || !snapshot){if(typeof showSaved==='function')showSaved('No recurring completion is available to undo');return {ok:false};}
+  task.nextDue=snapshot.nextDue;
+  task.status=snapshot.status==='paused'?'paused':'active';
+  task.completedOccurrences=Math.max(0,Number(snapshot.completedOccurrences)||0);
+  task.lastCompleted=snapshot.lastCompleted||'';
+  if(snapshot.hadCompletedAt) task.completedAt=snapshot.completedAt;
+  else delete task.completedAt;
+  v54uRemoveRecurringCompletionLog(id,snapshot.nextDue,snapshot.completionAt);
+  delete task.v54uUndoLastCompletion;
+  saveData();
+  renderAll();
+  try{renderTodayReminders();}catch(error){console.error('v54u Today refresh',error);}
+  try{renderRecurringHome();}catch(error){console.error('v54u recurring Home refresh',error);}
+  try{renderRecurringTasks();}catch(error){console.error('v54u recurring Lists refresh',error);}
+  try{renderWeekly();}catch(error){console.error('v54u This Week refresh',error);}
+  try{renderTimeline();}catch(error){console.error('v54u Timeline refresh',error);}
+  try{renderEveningReflection();}catch(_){ }
+  try{renderHiddenStatistics();}catch(_){ }
+  if(typeof showSaved==='function')showSaved(`${task.name||'Recurring task'} completion undone · due ${formatDate(task.nextDue)}`);
+  return {ok:true,nextDue:task.nextDue};
+}
+v54mAdvanceRecurringOccurrence=v54uAdvanceRecurringOccurrence;
+v54jAdvanceRecurringOccurrence=v54uAdvanceRecurringOccurrence;
+completeRecurringTask=v54uAdvanceRecurringOccurrence;
+
+// The occurrence vanishes from Home after completion, so Lists → Recurring tasks
+// is the explicit recovery point for an accidental completion.
+const v54uRecurringTaskCardBase=recurringTaskCard;
+recurringTaskCard=function(task){
+  const row=v54uRecurringTaskCardBase(task);
+  if(task?.v54uUndoLastCompletion){
+    const actions=row.querySelector('.card-actions');
+    if(actions){
+      const undo=document.createElement('button');
+      undo.type='button';undo.className='secondary-button';undo.textContent='Undo last completion';
+      undo.addEventListener('click',()=>undoLastRecurringCompletion(task.id));
+      actions.insertBefore(undo,actions.firstChild);
+    }
+  }
+  return row;
+};
+try{renderRecurringTasks();}catch(error){console.error('v54u initial recurring Lists refresh',error);}
+
+
+
+/* ===== v54v Today — Time Sensitive: timed appointment priority =====
+   One-change build: overdue items remain first. For items due today, appointments
+   with a saved time appear before untimed items and show that time in the row.
+   No completion, recurrence, list-menu or data behaviour is changed. */
+function v54vTodaySortKey(item){
+  const todayKey=localDateKey();
+  const dueKey=item?.dueDate?recurringDateKey(dateOnly(item.dueDate)):'';
+  if(dueKey && dueKey<todayKey) return [0,dueKey,''];
+  if(dueKey===todayKey && item?.itemType==='appointment' && item?.time) return [1,dueKey,String(item.time)];
+  if(dueKey===todayKey) return [2,dueKey,''];
+  return [3,dueKey,''];
+}
+function v54vCompareTodayItems(a,b){
+  const ka=v54vTodaySortKey(a),kb=v54vTodaySortKey(b);
+  for(let i=0;i<ka.length;i++){if(ka[i]<kb[i])return -1;if(ka[i]>kb[i])return 1;}
+  return 0;
+}
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;
+  const items=[...(getTodayReminderItems()||[])].sort(v54vCompareTodayItems);area.innerHTML='';
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{
+    const overdue=item.itemType!=='annual'&&dateOnly(item.dueDate)<new Date(new Date().setHours(0,0,0,0));
+    const timePart=item.itemType==='appointment'&&item.time?` · ${item.time}`:'';
+    const meta=`${item.source}${timePart} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    if(item.itemType==='recurring') area.appendChild(v54jTodayRecurringRow(item,meta));
+    else area.appendChild(v54jReminderRow(item,meta));
+  });
+};
+try{renderTodayReminders();}catch(error){console.error('v54v Today timed priority refresh',error);}
+
+
+/* ===== v54w Project Step Pending status =====
+   One-change build: project steps only. Pending steps remain visible in project
+   management but are skipped when the planner selects a project's Next step.
+   Waiting For, ordinary to-dos and recurring tasks are deliberately untouched. */
+function toggleProjectStepPending(projectId,stepId){
+  const project=(data.projects||[]).find(item=>String(item.id)===String(projectId));
+  const step=project?.steps?.find(item=>String(item.id)===String(stepId));
+  if(!project||!step||step.completed)return;
+  if(step.pending){
+    step.pending=false;
+    step.pendingReason='';
+  }else{
+    const reason=prompt('Optional reason this step is pending:',step.pendingReason||'');
+    if(reason===null)return;
+    step.pending=true;
+    step.pendingReason=String(reason||'').trim();
+  }
+  project.updatedAt=new Date().toISOString();
+  saveData();
+  renderAll();
+  try{refreshListsImmediately();}catch(_){ }
+  try{renderProjects();}catch(_){ }
+  try{renderProjectNextActions();}catch(_){ }
+  try{renderTodayReminders();}catch(_){ }
+  try{renderWeekly();}catch(_){ }
+  try{renderTimeline();}catch(_){ }
+}
+try{renderProjects();renderProjectNextActions();renderTodayReminders();renderWeekly();}catch(error){console.error('v54w Project Step Pending refresh',error);}
+
+/* ===== v54x Ordinary To-do Pending status =====
+   One-change build: ordinary non-recurring to-dos only. Waiting For,
+   recurring tasks and the accepted v54w project-step Pending behaviour are
+   deliberately untouched. */
+function toggleTodoPending(id){
+  const todo=(data.todos||[]).find(item=>String(item.id)===String(id));
+  if(!todo||todo.completed)return;
+  if(todo.pending){
+    todo.pending=false;
+    todo.pendingReason='';
+  }else{
+    const reason=prompt('Optional reason this to-do is pending:',todo.pendingReason||'');
+    if(reason===null)return;
+    todo.pending=true;
+    todo.pendingReason=String(reason||'').trim();
+  }
+  todo.updatedAt=new Date().toISOString();
+  saveData();
+  renderAll();
+  try{refreshListsImmediately();}catch(_){ }
+}
+const v54xToggleTodoBase=toggleTodo;
+toggleTodo=function(id){
+  const todo=(data.todos||[]).find(item=>String(item.id)===String(id));
+  const wasComplete=Boolean(todo?.completed);
+  v54xToggleTodoBase(id);
+  if(todo && !wasComplete && todo.completed && (todo.pending || todo.pendingReason)){
+    todo.pending=false;
+    todo.pendingReason='';
+    saveData();
+    renderAll();
+    try{refreshListsImmediately();}catch(_){ }
+  }
+};
+try{renderTodos();}catch(error){console.error('v54x To-do Pending refresh',error);}
+
+
+/* ===== v54ab Timeline appointment delete =====
+   One-change build: when an existing appointment is opened from Timeline (or any
+   other appointment edit route), the appointment dialog exposes Delete directly.
+   New appointments do not show Delete. Repeating appointments require confirmation
+   that the full repeating appointment will be removed.
+*/
+
+
+/* ===== v54ab Timeline delete for every item type =====
+   One-change build: any existing dated item opened from Timeline gets a direct
+   Delete action in its edit dialog. The delete targets the exact Timeline item:
+   a dated to-do/project step deletes only that step; a project deadline deletes
+   the project; recurring/annual/waiting/cleaning items delete their underlying record.
+   Appointment Delete continues to use the accepted v54aa dialog behaviour.
+*/
+function v54abTimelineIds(item){
+  const raw=String(item?.id||'');
+  const cut=raw.indexOf(':');
+  return cut<0?[raw,'']:[raw.slice(0,cut),raw.slice(cut+1)];
+}
+function v54abCloseOpenDialog(){
+  const dialogs=[...document.querySelectorAll('dialog[open]')];
+  const dlg=dialogs[dialogs.length-1];
+  if(!dlg)return;
+  try{dlg.close();}catch(_){dlg.removeAttribute('open');}
+}
+function v54abDeleteTimelineItem(item){
+  if(!item)return;
+  const type=item.type;
+  const [parentId,childId]=v54abTimelineIds(item);
+  let target=null,message='Delete this item?';
+  if(type==='appointment'){
+    const a=(data.appointments||[]).find(x=>String(x.id)===String(item.id));
+    if(!a)return;
+    const repeating=normaliseAppointmentRepeat(a).repeat!=='none';
+    message=repeating?'Delete this repeating appointment and all of its occurrences?':`Delete “${a.name||'this appointment'}”?`;
+    if(!confirm(message))return;
+    data.appointments=(data.appointments||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='todo'){
+    target=(data.todos||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete “${target.name||'this to-do'}”?`))return;
+    data.todos=(data.todos||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='todoStep'){
+    const todo=(data.todos||[]).find(x=>String(x.id)===String(parentId));
+    const step=(todo?.steps||[]).find(x=>String(x.id)===String(childId));if(!todo||!step)return;
+    if(!confirm(`Delete step “${step.name||'Untitled step'}”?`))return;
+    todo.steps=(todo.steps||[]).filter(x=>String(x.id)!==String(childId));
+    todo.completed=(todo.steps||[]).length>0&&todo.steps.every(s=>s.completed);
+  }else if(type==='projectStep'){
+    const project=(data.projects||[]).find(x=>String(x.id)===String(parentId));
+    const step=(project?.steps||[]).find(x=>String(x.id)===String(childId));if(!project||!step)return;
+    if(!confirm(`Delete step “${step.name||'Untitled step'}”?`))return;
+    project.steps=(project.steps||[]).filter(x=>String(x.id)!==String(childId));
+  }else if(type==='projectMilestone'||type==='project'){
+    target=(data.projects||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete project “${target.name||'this project'}” and all of its steps?`))return;
+    data.projects=(data.projects||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='cleaning'){
+    target=(data.cleaningTasks||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete cleaning task “${target.name||'this task'}”?`))return;
+    data.cleaningTasks=(data.cleaningTasks||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='recurring'){
+    target=(data.recurringTasks||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete recurring task “${target.name||'this task'}”? This removes the recurring task, not just one occurrence.`))return;
+    data.recurringTasks=(data.recurringTasks||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='annual'){
+    target=(data.annualDates||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete “${target.name||'this annual date'}”?`))return;
+    data.annualDates=(data.annualDates||[]).filter(x=>String(x.id)!==String(item.id));
+  }else if(type==='waiting'){
+    target=(data.waiting||[]).find(x=>String(x.id)===String(item.id));if(!target)return;
+    if(!confirm(`Delete “${target.name||'this pending note'}”?`))return;
+    data.waiting=(data.waiting||[]).filter(x=>String(x.id)!==String(item.id));
+  }else return;
+  saveData();v54abCloseOpenDialog();renderAll();showSaved('Deleted');
+}
+function v54abTimelineDeleteLabel(type){
+  if(type==='todoStep'||type==='projectStep')return 'Delete step';
+  if(type==='projectMilestone'||type==='project')return 'Delete project';
+  if(type==='recurring')return 'Delete recurring task';
+  return 'Delete';
+}
+function v54abAttachTimelineDelete(item){
+  if(!item||item.type==='appointment')return; // appointment already has accepted v54aa Delete
+  const dialogs=[...document.querySelectorAll('dialog[open]')];
+  const dlg=dialogs[dialogs.length-1];if(!dlg)return;
+  const actions=dlg.querySelector('.dialog-actions');if(!actions)return;
+  actions.querySelectorAll('[data-v54ab-timeline-delete]').forEach(b=>b.remove());
+  const button=document.createElement('button');
+  button.type='button';button.className='secondary-button danger-text';
+  button.dataset.v54abTimelineDelete='1';button.textContent=v54abTimelineDeleteLabel(item.type);
+  button.addEventListener('click',()=>v54abDeleteTimelineItem(item));
+  actions.insertBefore(button,actions.firstChild);
+}
+const v54abTimelineItemsBase=timelineItems;
+timelineItems=function(){
+  return v54abTimelineItemsBase().map(item=>{
+    const open=item.open;
+    return {...item,open:()=>{open();setTimeout(()=>v54abAttachTimelineDelete(item),0);}};
+  });
+};
+try{renderTimeline();}catch(error){console.error('v54ab Timeline delete refresh',error);}
+
+
+/* ===== v54ag authoritative Pending/Home stabilisation =====
+   Rebuilt from accepted v54ad. These are the final runtime definitions. */
+function v54agDate(value){try{return value?dateOnly(value):null;}catch(_){return null;}}
+function v54agToday(){const d=new Date();d.setHours(12,0,0,0);return d;}
+function v54agDue(value){const d=v54agDate(value);return Boolean(d)&&d<=v54agToday();}
+function v54agOverdue(value){const d=v54agDate(value);if(!d)return false;const t=new Date();t.setHours(0,0,0,0);return d<t;}
+function v54agPendingText(item){return `Pending${item?.pendingReason?` — ${item.pendingReason}`:''}`;}
+function v54agSetPending(kind,id,parentId,wanted){
+  if(kind==='todo'){
+    const item=(data.todos||[]).find(x=>String(x.id)===String(id));if(!item||item.completed)return;
+    item.pending=Boolean(wanted);if(!item.pending)item.pendingReason='';
+    else if(!item.pendingReason){const reason=prompt('Optional reason this to-do is pending:','');if(reason===null){item.pending=false;return;}item.pendingReason=String(reason||'').trim();}
+  }else if(kind==='step'){
+    const p=(data.projects||[]).find(x=>String(x.id)===String(parentId));const item=(p?.steps||[]).find(x=>String(x.id)===String(id));if(!p||!item||item.completed)return;
+    item.pending=Boolean(wanted);if(!item.pending)item.pendingReason='';
+    else if(!item.pendingReason){const reason=prompt('Optional reason this step is pending:','');if(reason===null){item.pending=false;return;}item.pendingReason=String(reason||'').trim();}
+    p.updatedAt=new Date().toISOString();
+  }
+  saveData();renderAll();try{refreshListsImmediately();}catch(_){}try{renderProjectNextActions();}catch(_){}try{renderTodayReminders();}catch(_){}try{renderFocusToday();}catch(_){}try{renderTimeline();}catch(_){}
+}
+function v54agPendingControl(kind,id,parentId,pending){
+  const label=document.createElement('label');label.className='pending-inline-toggle';
+  const input=document.createElement('input');input.type='checkbox';input.checked=Boolean(pending);input.setAttribute('aria-label',pending?'Pending — uncheck to mark active':'Mark pending');
+  input.addEventListener('click',e=>e.stopPropagation());input.addEventListener('change',e=>{e.stopPropagation();v54agSetPending(kind,id,parentId,input.checked);});
+  const text=document.createElement('span');text.textContent='Pending';label.append(input,text);return label;
+}
+function v54agMenu(item){
+  if(item.itemType==='todo'){
+    const x=(data.todos||[]).find(t=>String(t.id)===String(item.id));
+    return compactMenu(`<button onclick="closeAnchoredMenu();editTodo('${item.id}')">Edit</button>${x&&!x.completed?`<button onclick="closeAnchoredMenu();v54agSetPending('todo','${item.id}','',${!Boolean(x.pending)})">${x.pending?'Mark active':'Mark pending'}</button>`:''}<button onclick="closeAnchoredMenu();toggleTodo('${item.id}')">${x?.completed?'Mark incomplete':'Complete'}</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteTodo('${item.id}')">Delete</button>`,item.name||'to-do');
+  }
+  if(item.itemType==='step'){
+    const p=(data.projects||[]).find(t=>String(t.id)===String(item.parentId));const x=(p?.steps||[]).find(t=>String(t.id)===String(item.id));
+    return compactMenu(`<button onclick="closeAnchoredMenu();editStep('${item.parentId}','${item.id}')">Edit step</button>${x&&!x.completed?`<button onclick="closeAnchoredMenu();v54agSetPending('step','${item.id}','${item.parentId}',${!Boolean(x.pending)})">${x.pending?'Mark active':'Mark pending'}</button>`:''}<button onclick="closeAnchoredMenu();toggleStep('${item.parentId}','${item.id}')">${x?.completed?'Mark incomplete':'Complete step'}</button><button class="danger-text" onclick="closeAnchoredMenu();v54jDeleteProjectStep('${item.parentId}','${item.id}')">Delete step</button>`,item.name||'project step');
+  }
+  return v54jReminderMenu(item);
+}
+
+/* Today: start with accepted v54ad source so every established category is preserved,
+   then add Pending project steps that v54ad intentionally skips as Next steps. */
+const v54agTodayBase=getTodayReminderItems;
+getTodayReminderItems=function(){
+  let items=[];try{items=(v54agTodayBase()||[]).slice();}catch(error){console.error('v54ag Today base failed',error);}
+  const pendingTodoParents=new Set((data.todos||[]).filter(t=>t&&!t.completed&&t.pending).map(t=>String(t.id)));
+  items=items.filter(item=>!(item?.itemType==='todoStep'&&pendingTodoParents.has(String(item.parentId))));
+  const keyed=new Map();
+  items.forEach(i=>keyed.set(`${i.itemType}:${i.parentId||''}:${i.id}`,i));
+  (data.todos||[]).forEach(todo=>{
+    if(!todo||todo.completed||!todo.pending||!v54agDue(todo.dueDate))return;
+    const key=`todo::${todo.id}`;const existing=keyed.get(key);
+    if(existing){existing.pending=true;existing.pendingReason=todo.pendingReason||'';return;}
+    const row={id:todo.id,name:todo.name,details:todo.details||'',source:'To-do',dueDate:todo.dueDate,itemType:'todo',pending:true,pendingReason:todo.pendingReason||''};items.push(row);keyed.set(key,row);
+  });
+  (data.projects||[]).forEach(project=>{
+    if(!project||project.completed)return;
+    (project.steps||[]).forEach(step=>{
+      if(!step||step.completed||!step.pending||!v54agDue(step.dueDate))return;
+      const key=`step:${project.id}:${step.id}`;const existing=keyed.get(key);
+      if(existing){existing.pending=true;existing.pendingReason=step.pendingReason||'';return;}
+      const row={id:step.id,parentId:project.id,name:step.name,details:step.details||'',source:`Project: ${project.name}`,dueDate:step.dueDate,itemType:'step',pending:true,pendingReason:step.pendingReason||''};items.push(row);keyed.set(key,row);
+    });
+  });
+  return items;
+};
+
+/* Needs Attention: retain accepted v54ad candidates, then add due/overdue Pending
+   items even when also visible in Today. That makes Pending deliberately visible. */
+focusCandidateRows=function(){
+  const rows=[];const today=v54agToday();const todayIds=new Set();
+  try{(getTodayReminderItems()||[]).forEach(item=>{if(item.itemType==='todo')todayIds.add(`todo:${item.id}`);if(item.itemType==='todoStep')todayIds.add(`todoParent:${item.parentId}`);if(item.itemType==='step'&&!item.pending)todayIds.add(`project:${item.parentId}`);if(item.itemType==='cleaning')todayIds.add(`cleaning:${item.id}`);});}catch(_){}
+  (data.todos||[]).filter(x=>x&&!x.completed&&!x.pending&&!todayIds.has(`todo:${x.id}`)&&!todayIds.has(`todoParent:${x.id}`)).forEach(x=>rows.push({id:x.id,itemType:'todo',pending:false,name:x.name,meta:getTimingText(x),dueDate:x.dueDate,kind:'To-do',open:()=>editTodo(x.id),score:x.dueDate?daysBetween(today,dateOnly(x.dueDate)):40}));
+  (data.todos||[]).filter(x=>x&&!x.completed&&x.pending&&v54agDue(x.dueDate)).forEach(x=>rows.push({id:x.id,itemType:'todo',pending:true,name:x.name,meta:`${getTimingText(x)||'To-do'}${v54agOverdue(x.dueDate)?' · OVERDUE':''}`,dueDate:x.dueDate,kind:'To-do',open:()=>editTodo(x.id),score:x.dueDate?daysBetween(today,dateOnly(x.dueDate))-20:-20}));
+  (data.cleaningTasks||[]).filter(x=>x&&isDueTodayOrEarlier(x.nextDue)&&!todayIds.has(`cleaning:${x.id}`)).forEach(x=>rows.push({id:x.id,itemType:'cleaning',name:x.name,meta:`Cleaning · ${x.room||'Home'}`,dueDate:x.nextDue,kind:'Cleaning',open:()=>editCleaning(x.id),score:-2}));
+  (data.projects||[]).filter(p=>p&&!p.completed).forEach(p=>{
+    if(!todayIds.has(`project:${p.id}`)){const next=(p.steps||[]).find(x=>x&&!x.completed&&!x.pending);if(next)rows.push({id:next.id,parentId:p.id,itemType:'step',pending:false,name:next.name,meta:`Next action · ${p.name}`,dueDate:next.dueDate,kind:'Project',open:()=>editStep(p.id,next.id),score:next.dueDate?daysBetween(today,dateOnly(next.dueDate)):12});}
+    (p.steps||[]).filter(x=>x&&!x.completed&&x.pending&&v54agDue(x.dueDate)).forEach(x=>rows.push({id:x.id,parentId:p.id,itemType:'step',pending:true,name:x.name,meta:`Project: ${p.name}${x.dueDate?' · '+formatDate(x.dueDate):''}${v54agOverdue(x.dueDate)?' · OVERDUE':''}`,dueDate:x.dueDate,kind:'Project',open:()=>editStep(p.id,x.id),score:x.dueDate?daysBetween(today,dateOnly(x.dueDate))-20:-20}));
+  });
+  (data.waiting||[]).filter(x=>x&&!x.completed&&x.reviewDate&&dateOnly(x.reviewDate)<=today).forEach(x=>rows.push({id:x.id,itemType:'waiting',name:x.name,meta:'Pending note · review due',dueDate:x.reviewDate,kind:'Waiting',open:()=>editCapture('waiting',x.id),score:0}));
+  return rows.sort((a,b)=>a.score-b.score).slice(0,7);
+};
+
+renderTodayReminders=function(){
+  const area=document.getElementById('todayRemindersArea');if(!area)return;area.innerHTML='';
+  let items=[];try{items=[...(getTodayReminderItems()||[])].sort(v54vCompareTodayItems);}catch(error){console.error('v54ai Today failed',error);area.innerHTML='<div class="empty-state">Today could not refresh.</div>';return;}
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing time-sensitive needs attention today.</div>';return;}
+  items.forEach(item=>{try{
+    const overdue=item.itemType!=='annual'&&v54agOverdue(item.dueDate);
+    const timePart=item.itemType==='appointment'&&item.time?` · ${item.time}`:'';
+    const meta=`${item.source||''}${timePart} · ${formatDate(item.dueDate,item.itemType!=='annual')}${overdue?' · OVERDUE':''}`;
+    const row=item.itemType==='recurring'?v54jTodayRecurringRow(item,meta):v54jReminderRow(item,meta);
+    if(item.itemType==='todo'||item.itemType==='step'){
+      const old=row.querySelector('.item-menu-anchor');
+      const html=v54agMenu(item);
+      if(old&&html)old.outerHTML=html;
+    }
+    if(item.pending){
+      const copy=row.querySelector('.compact-copy,.v10-row-main');
+      if(copy){const line=document.createElement('span');line.className='pending-status-line';line.textContent=v54agPendingText(item);copy.appendChild(line);}
+    }
+    if(overdue)row.classList.add('overdue-row');
+    area.appendChild(row);
+  }catch(error){console.warn('v54ai Today row skipped',item?.id,error);}});
+};
+renderFocusToday=function(){
+  const area=document.getElementById('focusTodayArea');if(!area)return;area.innerHTML='';
+  let items=[];try{items=focusCandidateRows()||[];}catch(error){console.error('v54ai Needs Attention failed',error);area.innerHTML='<div class="empty-state">Needs Attention could not refresh.</div>';return;}
+  if(!items.length){area.innerHTML='<div class="empty-state calm-empty"><strong>You are clear for now.</strong><span>Capture a thought or add a task when something comes to mind.</span></div>';return;}
+  items.forEach(item=>{try{
+    const row=makeV10Row(item,{menu:(item.itemType==='todo'||item.itemType==='step')?v54agMenu(item):''});
+    if(item.pending){const main=row.querySelector('.v10-row-main');if(main){const line=document.createElement('span');line.className='pending-status-line';line.textContent=v54agPendingText(item);main.appendChild(line);}}
+    if(v54agOverdue(item.dueDate))row.classList.add('overdue-row');
+    area.appendChild(row);
+  }catch(error){console.warn('v54ai Needs Attention row skipped',item?.id,error);}});
+};
+
+/* Lists: final renderers keep the accepted portrait-safe row/menu layout and add
+   a compact Pending checkbox next to the existing menu. */
+const v54agTodosBase=renderTodos;
+renderTodos=function(){v54agTodosBase();};
+const v54agProjectsBase=renderProjects;
+renderProjects=function(){v54agProjectsBase();};
+
+/* Make the edit-form reason field respond immediately. */
+document.getElementById('itemPending')?.addEventListener('change',updateFormVisibility);
+
+/* Run after all historic overrides are loaded, and on PWA resume. */
+function v54agRefresh(){try{renderTodayReminders();}catch(e){console.error(e);}try{renderFocusToday();}catch(e){console.error(e);}try{renderTodos();}catch(e){console.error(e);}try{renderProjects();}catch(e){console.error(e);}try{renderProjectNextActions();}catch(e){console.error(e);}}
+setTimeout(v54agRefresh,250);
+window.addEventListener('pageshow',()=>setTimeout(v54agRefresh,50));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54agRefresh,50);});
+
+
+/* ===== v54aj visible Pending status =====
+   Display-only repair. Pending remains controlled from the three-dot menu.
+   A separate status line is shown beneath normal item metadata on Home, Lists
+   and Timeline for ordinary to-dos and project steps. */
+const v54ajTimelineItemsBase=timelineItems;
+timelineItems=function(){
+  return (v54ajTimelineItemsBase()||[]).map(item=>{
+    if(item.type==='todo'){
+      const todo=(data.todos||[]).find(x=>String(x.id)===String(item.id));
+      if(todo?.pending)return {...item,pending:true,pendingReason:todo.pendingReason||''};
+    }
+    if(item.type==='projectStep'){
+      const parts=String(item.id||'').split(':');
+      const project=(data.projects||[]).find(x=>String(x.id)===String(parts[0]));
+      const step=(project?.steps||[]).find(x=>String(x.id)===String(parts.slice(1).join(':')));
+      if(step?.pending)return {...item,pending:true,pendingReason:step.pendingReason||''};
+    }
+    return item;
+  });
+};
+
+renderTimeline=function(){
+  const area=document.getElementById('timelineArea'),summary=document.getElementById('timelineSummary');if(!area)return;
+  const {start,end}=timelineDateBounds(timelineRange),today=dateOnly(localDateKey());
+  const allItems=timelineItems();
+  const includeOverdue=['today','week','month','all'].includes(timelineRange);
+  const overdue=includeOverdue?allItems.filter(x=>dateOnly(x.date)<today):[];
+  const dated=allItems.filter(x=>{const d=dateOnly(x.date);return d>=start&&d<=end;});
+  const seen=new Set(),items=[...overdue,...dated].filter(x=>{const k=`${x.type}:${x.id}:${x.date}`;if(seen.has(k))return false;seen.add(k);return true;});
+  area.innerHTML='';
+  const labels={today:'today including overdue',tomorrow:'tomorrow',week:'in the next 7 days including overdue',month:'this month including overdue',all:'in the next year including overdue'};
+  if(summary)summary.textContent=`${items.length} ${items.length===1?'item':'items'} ${labels[timelineRange]}.`;
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing dated for this period.</div>';return;}
+  const appendRow=(item)=>{
+    const type=TIMELINE_TYPES[item.type]||{icon:'•',label:'Planner item'},row=document.createElement('button');row.type='button';row.className=`timeline-item timeline-${item.type}`;row.onclick=item.open;
+    const pendingLine=item.pending?`<span class="pending-status-line">Pending${item.pendingReason?' — '+escapeHtml(item.pendingReason):''}</span>`:'';
+    row.innerHTML=`<span class="timeline-icon" aria-hidden="true">${type.icon}</span><span class="timeline-copy"><strong>${escapeHtml(item.name)}</strong><span class="timeline-meta">${escapeHtml(type.label)}${item.time?' · '+escapeHtml(item.time):''}${item.detail?' · '+escapeHtml(item.detail):''}</span>${pendingLine}</span><span class="timeline-chevron" aria-hidden="true">›</span>`;
+    area.appendChild(row);
+  };
+  if(overdue.length){const h=document.createElement('h3');h.className='timeline-date-heading timeline-overdue-heading';h.textContent='Overdue';area.appendChild(h);overdue.forEach(appendRow);}
+  let current='';
+  dated.forEach(item=>{if(item.date!==current){current=item.date;const h=document.createElement('h3');h.className='timeline-date-heading';h.textContent=formatDate(item.date);area.appendChild(h);}appendRow(item);});
+};
+
+function v54ajRefreshVisiblePending(){
+  try{renderTodayReminders();}catch(e){console.error('v54aj Today refresh',e);}
+  try{renderFocusToday();}catch(e){console.error('v54aj Needs Attention refresh',e);}
+  try{renderTodos();}catch(e){console.error('v54aj To-do list refresh',e);}
+  try{renderProjects();}catch(e){console.error('v54aj Project list refresh',e);}
+  try{renderProjectNextActions();}catch(e){console.error('v54aj Project Home refresh',e);}
+  try{renderTimeline();}catch(e){console.error('v54aj Timeline refresh',e);}
+}
+setTimeout(v54ajRefreshVisiblePending,300);
+window.addEventListener('pageshow',()=>setTimeout(v54ajRefreshVisiblePending,80));
+
+
+/* ===== v54ak consolidated Pending view =====
+   Waiting For is now presented as Pending: a consolidated view/filter of all
+   current Pending ordinary to-dos, Pending project steps and existing standalone
+   Waiting For records (shown as Pending notes). The underlying `waiting` data key
+   is retained unchanged for safe backwards-compatible data/backup handling. */
+function v54akPendingEntries(){
+  const entries=[];
+  (data.todos||[]).forEach(todo=>{
+    if(!todo||todo.completed||!todo.pending)return;
+    entries.push({
+      kind:'todo',itemType:'todo',id:todo.id,name:todo.name||'Untitled to-do',
+      source:'To-do',date:todo.dueDate||'',pendingReason:todo.pendingReason||'',
+      open:()=>editTodo(todo.id)
+    });
+  });
+  (data.projects||[]).forEach(project=>{
+    if(!project||project.completed)return;
+    (project.steps||[]).forEach(step=>{
+      if(!step||step.completed||!step.pending)return;
+      entries.push({
+        kind:'step',itemType:'step',id:step.id,parentId:project.id,
+        name:step.name||'Untitled step',source:`Project: ${project.name||'Untitled project'}`,
+        date:step.dueDate||'',pendingReason:step.pendingReason||'',
+        open:()=>editStep(project.id,step.id)
+      });
+    });
+  });
+  (data.waiting||[]).forEach(note=>{
+    if(!note||note.completed)return;
+    entries.push({
+      kind:'note',itemType:'waiting',id:note.id,name:note.name||'Untitled pending note',
+      source:'Pending note',date:note.reviewDate||'',note:note.note||note.details||'',
+      open:()=>editCapture('waiting',note.id)
+    });
+  });
+  return entries.sort((left,right)=>{
+    const ld=String(left.date||'9999-12-31'),rd=String(right.date||'9999-12-31');
+    if(ld!==rd)return ld.localeCompare(rd);
+    if(left.source!==right.source)return left.source.localeCompare(right.source);
+    return String(left.name||'').localeCompare(String(right.name||''));
+  });
+}
+function v54akPendingMenu(entry){
+  if(entry.kind==='todo')return v54agMenu({itemType:'todo',id:entry.id,name:entry.name});
+  if(entry.kind==='step')return v54agMenu({itemType:'step',id:entry.id,parentId:entry.parentId,name:entry.name});
+  return compactMenu(`<button onclick="closeAnchoredMenu();editCapture('waiting','${entry.id}')">Edit pending note</button><button onclick="closeAnchoredMenu();completeWaiting('${entry.id}')">Mark resolved</button><button class="danger-text" onclick="closeAnchoredMenu();deleteCapture('waiting','${entry.id}')">Delete</button>`,entry.name||'pending note');
+}
+function v54akPendingRow(entry){
+  const meta=[];
+  meta.push(entry.source);
+  if(entry.date)meta.push(entry.kind==='note'?`Review ${formatDate(entry.date)}`:`Due ${formatDate(entry.date)}`);
+  const row=makeV10Row({name:entry.name,meta:meta.join(' · '),dueDate:entry.date,open:entry.open},{complete:false,menu:v54akPendingMenu(entry)});
+  const main=row.querySelector('.v10-row-main');
+  if(main){
+    const line=document.createElement('span');line.className='pending-status-line';
+    if(entry.kind==='note')line.textContent=`Pending note${entry.note?` — ${entry.note}`:''}`;
+    else line.textContent=`Pending${entry.pendingReason?` — ${entry.pendingReason}`:''}`;
+    main.appendChild(line);
+  }
+  return row;
+}
+function openPendingList(){showView('tasks');setTimeout(()=>jumpToList('waitingListSection'),30);}
+openWaitingForList=openPendingList;
+renderWaiting=function(){
+  const area=document.getElementById('waitingArea');if(!area)return;area.innerHTML='';
+  const items=v54akPendingEntries();
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing is currently Pending.</div>';return;}
+  items.forEach(item=>area.appendChild(v54akPendingRow(item)));
+};
+renderWaitingHome=function(){
+  const area=document.getElementById('homeWaitingArea');if(!area)return;area.innerHTML='';
+  const items=v54akPendingEntries().slice(0,5);
+  if(!items.length){area.innerHTML='<div class="empty-state">Nothing is currently Pending.</div>';return;}
+  items.forEach(item=>area.appendChild(v54akPendingRow(item)));
+};
+
+/* The Daily Companion card uses the same consolidated count and opens the same
+   Pending view. The historic `waiting` target name is retained internally. */
+v52cWaitingFollowups=function(){return v54akPendingEntries();};
+const v54akDailyCompanionBase=renderDailyCompanion;
+renderDailyCompanion=function(){
+  v54akDailyCompanionBase();
+  const cards=[...document.querySelectorAll('#companionDashboardCards .companion-dashboard-card')];
+  const card=cards.find(node=>node.dataset.companionTarget==='waiting');
+  if(card){
+    const count=v54akPendingEntries().length;
+    const title=card.querySelector('span'),value=card.querySelector('strong'),detail=card.querySelector('small');
+    if(title)title.textContent='Pending';if(value)value.textContent=String(count);
+    if(detail)detail.textContent=count===1?'item pending':'items pending';
+  }
+};
+TIMELINE_TYPES.waiting={icon:'⏳',label:'Pending note'};
+try{V52A_SECTION_HELP.Pending='All current Pending work in one place: to-dos, project steps and standalone Pending notes.';}catch(_){}
+
+function v54akRefreshPendingView(){
+  try{renderWaiting();}catch(e){console.error('v54ak Pending list refresh',e);}
+  try{renderWaitingHome();}catch(e){console.error('v54ak Pending Home refresh',e);}
+  try{renderDailyCompanion();}catch(e){console.error('v54ak Pending dashboard refresh',e);}
+}
+setTimeout(v54akRefreshPendingView,360);
+window.addEventListener('pageshow',()=>setTimeout(v54akRefreshPendingView,100));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54akRefreshPendingView,100);});
+
+
+/* ===== v54al Home priority order + daypart routine placement =====
+   Presentation-only build from stable v54ak.
+   - Daily Rhythm appears inside the Daily Companion during morning/afternoon.
+   - Evening Routine appears there when the existing daypart says Good evening.
+   - Active routine defaults collapsed once, then respects the user's saved state.
+   - Inactive routine is hidden instead of occupying permanent Home space.
+   - Main Home order: Today -> Today's Focus -> Needs Attention -> Projects ->
+     Pending -> Recurring -> Brain Inbox -> Planner Health -> reflections.
+   No task/project/pending/recurring/timeline data logic is changed.
+*/
+const V54AL_ROUTINE_INIT_KEY='myLifePlannerDaypartRoutineInitialisedV54al';
+
+function v54alEnsureRoutineInitialState(key,panel){
+  if(!panel)return;
+  const saved=getHomePanelStates();
+  const init=(()=>{try{return JSON.parse(localStorage.getItem(V54AL_ROUTINE_INIT_KEY)||'{}')}catch(_){return {}}})();
+  if(!init[key] && saved[key]===undefined){
+    saved[key]=true;
+    saveHomePanelStates(saved);
+    init[key]=true;
+    try{localStorage.setItem(V54AL_ROUTINE_INIT_KEY,JSON.stringify(init));}catch(_){}
+  }
+  applyHomePanelState(panel,Boolean(getHomePanelStates()[key]));
+}
+
+function v54alPlaceDaypartRoutine(){
+  const brief=document.getElementById('morningBriefPanel');
+  const daily=document.getElementById('homeDailyRhythmPanel');
+  const evening=document.getElementById('homeEveningPanel');
+  if(!brief||!daily||!evening)return;
+
+  const part=v52cDaypart(new Date());
+  const active=part.key==='evening'?evening:daily;
+  const inactive=part.key==='evening'?daily:evening;
+  const activeKey=part.key==='evening'?'eveningRoutine':'dailyRhythm';
+
+  inactive.classList.add('v54al-routine-inactive');
+  inactive.setAttribute('aria-hidden','true');
+  active.classList.remove('v54al-routine-inactive');
+  active.removeAttribute('aria-hidden');
+
+  let host=document.getElementById('daypartRoutineHost');
+  if(!host){
+    host=document.createElement('div');
+    host.id='daypartRoutineHost';
+    host.className='daypart-routine-host';
+    const message=document.getElementById('dailyCompanionMessage');
+    if(message)message.insertAdjacentElement('afterend',host);
+    else brief.appendChild(host);
+  }
+  if(active.parentElement!==host)host.appendChild(active);
+  if(inactive.parentElement===host)brief.parentElement?.appendChild(inactive);
+
+  v54alEnsureRoutineInitialState(activeKey,active);
+}
+
+function v54alPlaceHomeSections(){
+  const quick=document.querySelector('.home-quick-actions');
+  if(!quick)return;
+  const brief=document.getElementById('morningBriefPanel');
+  const today=document.getElementById('homeTodayPanel');
+  const focus=document.getElementById('todayFocusPanel');
+  const needs=document.getElementById('needsAttentionPanel');
+  const projects=document.getElementById('homeProjectsPanel');
+  const pending=document.getElementById('homeWaitingPanel');
+  const recurring=document.getElementById('homeRecurringPanel');
+  const inbox=document.getElementById('homeBrainInboxPanel');
+  const health=document.getElementById('plannerHealthPanel');
+  const eveningReflection=document.getElementById('eveningReflectionPanel');
+  const weeklyReflection=document.getElementById('weeklyReflectionPanel');
+
+  v54alPlaceDaypartRoutine();
+
+  let after=brief||quick;
+  [today,focus,needs,projects,pending,recurring,inbox,health,eveningReflection,weeklyReflection]
+    .filter(Boolean)
+    .forEach(node=>{
+      const actual=(node.id==='homeTodayPanel'&&node.closest('.dashboard-grid'))?node.closest('.dashboard-grid'):node;
+      if(actual!==after){
+        after.insertAdjacentElement('afterend',actual);
+        after=actual;
+      }
+    });
+
+  document.querySelectorAll('.dashboard-grid').forEach(grid=>{
+    if(!grid.children.length)grid.remove();
+  });
+}
+
+const v54alRenderDailyCompanionBase=renderDailyCompanion;
+renderDailyCompanion=function(){
+  v54alRenderDailyCompanionBase();
+  v54alPlaceDaypartRoutine();
+  v54alPlaceHomeSections();
+};
+
+function v54alRefreshHomeLayout(){
+  try{v54alPlaceDaypartRoutine();}catch(error){console.error('v54al daypart routine placement',error);}
+  try{v54alPlaceHomeSections();}catch(error){console.error('v54al Home order placement',error);}
+}
+
+setTimeout(v54alRefreshHomeLayout,420);
+window.addEventListener('pageshow',()=>setTimeout(v54alRefreshHomeLayout,120));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54alRefreshHomeLayout,120);});
+window.addEventListener('resize',()=>setTimeout(v54alRefreshHomeLayout,80));
+
+
+/* ===== v54am Home Project "Next" label =====
+   Presentation-only change from stable v54al.
+   The first incomplete non-Pending project step is visibly labelled "Next"
+   in the expanded Home -> Projects card. Project ordering, Pending, completion,
+   Timeline and Next-step selection logic are unchanged. */
+const v54amProjectNextActionsBase=renderProjectNextActions;
+renderProjectNextActions=function(){
+  const area=document.getElementById('projectNextActionsArea');if(!area)return;area.innerHTML='';
+  const projects=(data.projects||[]).filter(p=>!p.completed);
+  if(!projects.length){area.innerHTML='<div class="empty-state">No active projects need your attention.</div>';return;}
+  const openStates=getHomeProjectStates();
+  [...projects].sort(sortByDueDate).forEach(project=>{
+    const steps=Array.isArray(project.steps)?project.steps:[];
+    const completedCount=steps.filter(step=>step.completed).length;
+    const nextStep=steps.find(step=>!step.completed&&!step.pending);
+
+    const card=document.createElement('section');card.className='home-project-card';
+    const heading=document.createElement('div');heading.className='home-project-heading';
+    heading.innerHTML=`<button type="button" class="home-project-toggle" onclick="toggleHomeProject('${project.id}')" aria-expanded="${Boolean(openStates[project.id])}"><span aria-hidden="true">${openStates[project.id]?'▾':'▸'}</span><span><strong>${escapeHtml(project.name||'Untitled project')}</strong><small>${steps.length?`${completedCount} of ${steps.length} steps`:'No steps yet'}</small></span></button><button type="button" class="small-button secondary-button home-project-manage" onclick="editProject('${project.id}')">Manage</button>`;
+    card.appendChild(heading);
+
+    const body=document.createElement('div');body.className='home-project-steps';body.hidden=!openStates[project.id];
+    if(!steps.length){
+      body.innerHTML='<div class="empty-state">No steps yet. Use Manage to add the first step.</div>';
+    }else{
+      steps.forEach(step=>{
+        const row=document.createElement('div');row.className=`v10-row home-project-step ${step.completed?'completed-row':''}`;
+        const pendingLine=step.pending?`<span class="pending-status-line">Pending${step.pendingReason?' — '+escapeHtml(step.pendingReason):''}</span>`:'';
+        const nextLine=nextStep&&String(nextStep.id)===String(step.id)?'<span class="project-next-status-line">Next</span>':'';
+        row.innerHTML=`<button type="button" class="complete-dot" onclick="toggleStep('${project.id}','${step.id}')" aria-label="${step.completed?'Reinstate':'Complete'} ${escapeHtml(step.name||'step')}">${step.completed?'✓':''}</button><button type="button" class="v10-row-main" onclick="editStep('${project.id}','${step.id}')"><span class="v10-row-title">${escapeHtml(step.name||'Untitled step')}</span><span class="v10-row-meta">${step.dueDate?'Due '+formatDate(step.dueDate):'No date'} · Tap text to edit</span>${nextLine}${pendingLine}</button>`;
+        body.appendChild(row);
+      });
+    }
+    card.appendChild(body);
+    area.appendChild(card);
+  });
+};
+try{renderProjectNextActions();}catch(error){console.error('v54am Project Next label refresh',error);}
+
+
+/* ===== v54an authoritative Home placement repair =====
+   Fixes desktop/iPhone divergence caused by legacy Home optimisers running after
+   the v54al layout. The v54al Home/daypart placement is now always the final
+   authority after optimiseHomeOrder() and v52cOptimiseHomeOrder() complete.
+   No Home data renderer, project/Pending/recurring/Timeline logic is changed. */
+
+const v54anLegacyOptimiseHomeOrder=optimiseHomeOrder;
+optimiseHomeOrder=function(){
+  const result=v54anLegacyOptimiseHomeOrder.apply(this,arguments);
+  try{v54alRefreshHomeLayout();}catch(error){console.error('v54an final Home placement after optimiseHomeOrder',error);}
+  setTimeout(()=>{try{v54alRefreshHomeLayout();}catch(error){console.error('v54an deferred Home placement',error);}},0);
+  return result;
+};
+
+const v54anLegacyV52cOptimiseHomeOrder=v52cOptimiseHomeOrder;
+v52cOptimiseHomeOrder=function(){
+  const result=v54anLegacyV52cOptimiseHomeOrder.apply(this,arguments);
+  try{v54alRefreshHomeLayout();}catch(error){console.error('v54an final Home placement after v52cOptimiseHomeOrder',error);}
+  setTimeout(()=>{try{v54alRefreshHomeLayout();}catch(error){console.error('v54an deferred companion placement',error);}},0);
+  return result;
+};
+
+/* Also enforce the final layout after the public refresh surfaces known to run
+   on both desktop browsers and the installed iPhone PWA. */
+function v54anFinaliseHomePlacement(){
+  try{v54alRefreshHomeLayout();}catch(error){console.error('v54an final Home placement',error);}
+}
+setTimeout(v54anFinaliseHomePlacement,520);
+window.addEventListener('pageshow',()=>setTimeout(v54anFinaliseHomePlacement,160));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54anFinaliseHomePlacement,160);});
+window.addEventListener('resize',()=>setTimeout(v54anFinaliseHomePlacement,120));
+
+
+/* ===== v54ap reliable daily recovery =====
+   Replaces quota-prone localStorage daily snapshots with IndexedDB.
+   Existing localStorage recovery copies are migrated once, then removed only
+   after IndexedDB has successfully stored and read them back.
+   A verified snapshot is created on app start and updated on every normal save.
+   Manual Export / Share backup remains the independent off-device backup route. */
+
+const V54AP_BACKUP_DB='MyLifePlannerRecoveryV54ap';
+const V54AP_BACKUP_STORE='dailyBackups';
+const V54AP_BACKUP_LIMIT=7;
+const V54AP_BACKUP_VERIFIED_KEY='lifePlannerBackupVerifiedV54ap';
+let v54apBackupCache=[];
+let v54apBackupDbPromise=null;
+let v54apBackupInitialised=false;
+
+function v54apOpenBackupDb(){
+  if(v54apBackupDbPromise)return v54apBackupDbPromise;
+  v54apBackupDbPromise=new Promise((resolve,reject)=>{
+    if(!('indexedDB' in window))return reject(new Error('IndexedDB is not available'));
+    const request=indexedDB.open(V54AP_BACKUP_DB,1);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(V54AP_BACKUP_STORE)){
+        const store=db.createObjectStore(V54AP_BACKUP_STORE,{keyPath:'date'});
+        store.createIndex('savedAt','savedAt',{unique:false});
+      }
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Could not open backup storage'));
+  });
+  return v54apBackupDbPromise;
+}
+
+function v54apRequest(request){
+  return new Promise((resolve,reject)=>{
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Backup storage request failed'));
+  });
+}
+
+function v54apTransactionDone(tx){
+  return new Promise((resolve,reject)=>{
+    tx.oncomplete=()=>resolve();
+    tx.onabort=()=>reject(tx.error||new Error('Backup transaction aborted'));
+    tx.onerror=()=>reject(tx.error||new Error('Backup transaction failed'));
+  });
+}
+
+function v54apSnapshot(serialised=JSON.stringify(data)){
+  return {
+    date:localDateKey(),
+    savedAt:new Date().toISOString(),
+    data:serialised,
+    checks:collectChecks(),
+    settings:getSettings()
+  };
+}
+
+async function v54apLoadBackupCache(){
+  const db=await v54apOpenBackupDb();
+  const tx=db.transaction(V54AP_BACKUP_STORE,'readonly');
+  const store=tx.objectStore(V54AP_BACKUP_STORE);
+  const copies=await v54apRequest(store.getAll());
+  await v54apTransactionDone(tx);
+  v54apBackupCache=(Array.isArray(copies)?copies:[])
+    .sort((left,right)=>String(right.savedAt||right.date||'').localeCompare(String(left.savedAt||left.date||'')));
+  return v54apBackupCache;
+}
+
+async function v54apPruneBackups(){
+  const db=await v54apOpenBackupDb();
+  const copies=await v54apLoadBackupCache();
+  const remove=copies.slice(V54AP_BACKUP_LIMIT);
+  if(!remove.length)return;
+  const tx=db.transaction(V54AP_BACKUP_STORE,'readwrite');
+  const store=tx.objectStore(V54AP_BACKUP_STORE);
+  remove.forEach(copy=>store.delete(copy.date));
+  await v54apTransactionDone(tx);
+  await v54apLoadBackupCache();
+}
+
+function v54apSetBackupStatus(ok,message=''){
+  const payload={ok:Boolean(ok),message:String(message||''),at:new Date().toISOString()};
+  try{localStorage.setItem(V54AP_BACKUP_VERIFIED_KEY,JSON.stringify(payload));}catch(_){}
+  const indicator=document.getElementById('backupVerificationStatus');
+  if(indicator){
+    indicator.textContent=ok?`Last verified automatic recovery: ${new Date(payload.at).toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'short'})}`:`Automatic recovery needs attention: ${payload.message||'write failed'}`;
+    indicator.classList.toggle('backup-warning',!ok);
+  }
+}
+
+async function v54apWriteBackup(serialised=JSON.stringify(data)){
+  try{
+    const snapshot=v54apSnapshot(serialised);
+    const db=await v54apOpenBackupDb();
+    const tx=db.transaction(V54AP_BACKUP_STORE,'readwrite');
+    tx.objectStore(V54AP_BACKUP_STORE).put(snapshot);
+    await v54apTransactionDone(tx);
+
+    /* Read-after-write verification: do not claim success until today's copy is
+       present and contains non-empty planner data. */
+    const verifyTx=db.transaction(V54AP_BACKUP_STORE,'readonly');
+    const saved=await v54apRequest(verifyTx.objectStore(V54AP_BACKUP_STORE).get(snapshot.date));
+    await v54apTransactionDone(verifyTx);
+    if(!saved||!saved.data)throw new Error('Backup verification failed');
+
+    await v54apPruneBackups();
+    v54apSetBackupStatus(true);
+    try{renderDailyBackups();}catch(_){}
+    try{renderDailyCompanion();}catch(_){}
+    return true;
+  }catch(error){
+    console.error('Automatic recovery backup failed',error);
+    v54apSetBackupStatus(false,error?.message||String(error));
+    return false;
+  }
+}
+
+async function v54apMigrateLegacyBackups(){
+  let legacy=[];
+  try{
+    const candidates=[RECOVERY_KEY,...LEGACY_RECOVERY_KEYS];
+    for(const key of candidates){
+      const parsed=JSON.parse(localStorage.getItem(key)||'[]');
+      if(Array.isArray(parsed))legacy.push(...parsed);
+    }
+  }catch(_){}
+  if(!legacy.length)return;
+
+  const byDate=new Map();
+  legacy.forEach(copy=>{
+    if(!copy?.date||!copy?.data)return;
+    const current=byDate.get(copy.date);
+    if(!current||String(copy.savedAt||'')>String(current.savedAt||''))byDate.set(copy.date,copy);
+  });
+
+  const db=await v54apOpenBackupDb();
+  const tx=db.transaction(V54AP_BACKUP_STORE,'readwrite');
+  const store=tx.objectStore(V54AP_BACKUP_STORE);
+  [...byDate.values()].forEach(copy=>store.put(copy));
+  await v54apTransactionDone(tx);
+
+  /* Verify migration before freeing the quota-heavy localStorage copies. */
+  await v54apLoadBackupCache();
+  const dates=new Set(v54apBackupCache.map(copy=>copy.date));
+  const allMigrated=[...byDate.keys()].every(date=>dates.has(date));
+  if(allMigrated){
+    try{
+      localStorage.removeItem(RECOVERY_KEY);
+      LEGACY_RECOVERY_KEYS.forEach(key=>localStorage.removeItem(key));
+    }catch(_){}
+  }
+}
+
+async function v54apInitialiseBackups(){
+  if(v54apBackupInitialised)return;
+  v54apBackupInitialised=true;
+  try{
+    await v54apMigrateLegacyBackups();
+    await v54apLoadBackupCache();
+
+    /* Always create/refresh today's verified recovery snapshot when the app is
+       opened. This fixes the old behaviour where a day only existed if a save
+       happened to occur. */
+    await v54apWriteBackup(JSON.stringify(normaliseData(data)));
+  }catch(error){
+    console.error('Backup initialisation failed',error);
+    v54apSetBackupStatus(false,error?.message||String(error));
+  }
+}
+
+/* Keep saveData synchronous for every existing caller. The primary planner save
+   remains localStorage; the recovery copy is queued independently in IndexedDB. */
+createRecoveryCopy=function(serialised){
+  void v54apWriteBackup(serialised);
+};
+
+/* Synchronous compatibility for existing renderers: cache is filled async and
+   renderDailyBackups refreshes as soon as IndexedDB loads. */
+getDailyBackups=function(){
+  if(v54apBackupCache.length)return v54apBackupCache.slice();
+  try{
+    const legacy=JSON.parse(localStorage.getItem(RECOVERY_KEY)||'[]');
+    return Array.isArray(legacy)?legacy:[];
+  }catch(_){return [];}
+};
+
+renderDailyBackups=function(){
+  const area=document.getElementById('dailyBackupsArea');if(!area)return;
+  const copies=getDailyBackups();
+  area.innerHTML='';
+  if(!copies.length){
+    area.innerHTML='<div class="empty-state">No verified automatic recovery snapshot is available yet.</div>';
+    return;
+  }
+  copies.slice(0,V54AP_BACKUP_LIMIT).forEach(copy=>{
+    const row=document.createElement('div');row.className='backup-row';
+    const date=new Date(`${copy.date}T12:00:00`).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
+    const time=copy.savedAt?new Date(copy.savedAt).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'';
+    row.innerHTML=`<div><strong>${escapeHtml(date)}</strong><div class="card-meta">Verified snapshot${time?` · latest save ${escapeHtml(time)}`:''}</div></div><button type="button" class="small-button">Restore</button>`;
+    row.querySelector('button').addEventListener('click',()=>restoreDailyBackup(copy.date));
+    area.appendChild(row);
+  });
+};
+
+restoreDailyBackup=async function(dateKey){
+  if(!v54apBackupCache.length)await v54apLoadBackupCache();
+  const copy=v54apBackupCache.find(item=>item.date===dateKey);
+  if(!copy)return alert('That automatic recovery snapshot is no longer available.');
+  const label=new Date(`${dateKey}T12:00:00`).toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'});
+  if(!confirm(`Restore the recovery snapshot from ${label}? A verified safety snapshot of your current planner will be made first.`))return;
+  try{
+    const safetyOk=await v54apWriteBackup(JSON.stringify(data));
+    if(!safetyOk)throw new Error('Could not create the pre-restore safety snapshot');
+    data=normaliseData(JSON.parse(copy.data));
+    localStorage.setItem(DATA_KEY,JSON.stringify(data));
+    Object.entries(copy.checks||{}).forEach(([key,value])=>localStorage.setItem(key,value));
+    if(copy.settings)localStorage.setItem(SETTINGS_KEY,JSON.stringify(copy.settings));
+    applySettings();
+    renderAll();
+    showSaved('Recovery snapshot restored');
+    await v54apWriteBackup(JSON.stringify(data));
+  }catch(error){
+    console.error('Recovery restore failed',error);
+    alert('That recovery snapshot could not be restored safely.');
+  }
+};
+
+restoreLatestRecovery=async function(){
+  if(!v54apBackupCache.length)await v54apLoadBackupCache();
+  const latest=v54apBackupCache[0];
+  if(!latest)return alert('There is no automatic recovery snapshot available yet.');
+  return restoreDailyBackup(latest.date);
+};
+
+/* Keep storage information accurate now that recovery copies are in IndexedDB. */
+const v54apUpdateStorageStatusBase=updateStorageStatus;
+updateStorageStatus=function(){
+  v54apUpdateStorageStatusBase();
+  const status=document.getElementById('storageStatus');
+  if(!status)return;
+  const saved=localStorage.getItem(DATA_KEY)||LEGACY_DATA_KEYS.map(key=>localStorage.getItem(key)).find(Boolean);
+  status.textContent=saved
+    ? `Planner data saved privately on this device (${Math.max(1,Math.round(new Blob([saved]).size/1024))} KB) · ${v54apBackupCache.length} verified automatic recovery snapshot${v54apBackupCache.length===1?'':'s'}.`
+    :'No planner information has been saved yet.';
+};
+
+function v54apRenderBackupVerification(){
+  const box=document.getElementById('backupVerificationStatus');if(!box)return;
+  try{
+    const payload=JSON.parse(localStorage.getItem(V54AP_BACKUP_VERIFIED_KEY)||'null');
+    if(payload?.at){
+      box.textContent=payload.ok
+        ? `Last verified automatic recovery: ${new Date(payload.at).toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'short'})}`
+        : `Automatic recovery needs attention: ${payload.message||'write failed'}`;
+      box.classList.toggle('backup-warning',!payload.ok);
+    }
+  }catch(_){}
+}
+
+setTimeout(()=>{v54apInitialiseBackups();v54apRenderBackupVerification();},700);
+window.addEventListener('pageshow',()=>setTimeout(()=>{v54apInitialiseBackups();v54apLoadBackupCache().then(()=>{renderDailyBackups();updateStorageStatus();v54apRenderBackupVerification();}).catch(error=>v54apSetBackupStatus(false,error?.message||String(error)));},180));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(()=>v54apLoadBackupCache().then(()=>{renderDailyBackups();updateStorageStatus();v54apRenderBackupVerification();}).catch(error=>v54apSetBackupStatus(false,error?.message||String(error))),180);});
+
+
+/* ===== v54aq Brain Inbox image integrity ===== */
+window.currentItemAttachment=null;
+
+function v54aqRenderItemAttachment(item,type){
+  const area=document.getElementById('itemAttachmentPreview');
+  if(!area)return;
+  const attachment=(['project','todo','appointment'].includes(type)&&item?.attachment?.data)?item.attachment:null;
+  window.currentItemAttachment=attachment;
+  if(!attachment){area.classList.add('hidden');area.innerHTML='';return;}
+  const image=attachment.type?.startsWith('image/');
+  const visual=image?`<img src="${attachment.data}" alt="${escapeHtml(attachment.name||'Attachment')}">`:`<span class="attachment-file-icon" aria-hidden="true">📄</span>`;
+  area.innerHTML=`<button type="button" class="item-attachment-open" onclick="showAttachmentViewer(window.currentItemAttachment)" aria-label="Open item attachment">${visual}<span><strong>${escapeHtml(attachment.name||'Attachment')}</strong><small>${image?'Tap to view image':'Open attachment'}</small></span></button>`;
+  area.classList.remove('hidden');
+}
+
+const v54aqClearFormBase=clearForm;
+clearForm=function(){
+  v54aqClearFormBase();
+  window.currentItemAttachment=null;
+  const area=document.getElementById('itemAttachmentPreview');
+  if(area){area.classList.add('hidden');area.innerHTML='';}
+};
+
+const v54aqLoadCommonBase=loadCommon;
+loadCommon=function(item,type,parentId=''){
+  v54aqLoadCommonBase(item,type,parentId);
+  v54aqRenderItemAttachment(item,type);
+};
+
+
+/* ===== v54ar attachment consistency =====
+   Keep Brain Inbox attachments when converting to Project, To-do or Appointment.
+   Appointment conversion is dialog-based, so attachment transfer happens only
+   after a successful appointment save. */
+const v54arSaveAppointmentBase=saveAppointment;
+saveAppointment=function(){
+  const inboxId=String(pendingInboxAppointmentId||'');
+  const inboxSource=inboxId?(data.inbox||[]).find(x=>String(x.id)===inboxId):null;
+  const draftAttachment=pendingInboxDraft?.attachment||null;
+  const sourceAttachment=inboxSource?.attachment||draftAttachment||null;
+  const beforeIds=new Set((data.appointments||[]).map(x=>String(x.id)));
+  const result=v54arSaveAppointmentBase();
+  if(result&&sourceAttachment){
+    const newAppointment=(data.appointments||[]).find(x=>!beforeIds.has(String(x.id)))||(data.appointments||[])[0];
+    if(newAppointment&&!newAppointment.attachment){
+      newAppointment.attachment=sourceAttachment;
+      saveData();renderAll();
+    }
+  }
+  return result;
+};
+
+
+/* ===== v54as attachment integrity + completed To-do cleanup =====
+   - Uses verified attachment transfer for Brain Inbox -> To-do/Project/Appointment.
+   - Shows appointment attachments in the appointment editor.
+   - Adds explicit cleanup for completed To-dos older than two calendar months.
+   - No silent/automatic deletion. */
+
+function v54asCloneAttachment(attachment){
+  if(!attachment)return null;
+  try{return JSON.parse(JSON.stringify(attachment));}
+  catch(_){return attachment;}
+}
+
+function v54asAttachmentIntact(record,attachment){
+  if(!attachment)return true;
+  return Boolean(record?.attachment?.data && record.attachment.data===attachment.data);
+}
+
+function v54asCreateConvertedRecord(type,draft){
+  const attachment=v54asCloneAttachment(draft.attachment);
+  const id=uid();
+  if(type==='todo'){
+    data.todos.unshift({id,name:draft.name,details:draft.note||'',timingType:'none',dueDate:'',completed:false,steps:[],attachment,createdAt:new Date().toISOString()});
+    return {id,list:'todos'};
+  }
+  if(type==='project'){
+    data.projects.unshift({id,name:draft.name,details:draft.note||'',timingType:'none',dueDate:'',completed:false,steps:[],attachment,createdAt:new Date().toISOString()});
+    return {id,list:'projects'};
+  }
+  return null;
+}
+
+function v54asFinishVerifiedInboxConversion(sourceId,type,draft){
+  const created=v54asCreateConvertedRecord(type,draft);
+  if(!created)return false;
+  saveData();
+  const saved=(data[created.list]||[]).find(x=>String(x.id)===String(created.id));
+  if(!v54asAttachmentIntact(saved,draft.attachment)){
+    data[created.list]=(data[created.list]||[]).filter(x=>String(x.id)!==String(created.id));
+    saveData();
+    alert('The attachment could not be preserved, so the Brain Inbox item was left in place. Please try again.');
+    return false;
+  }
+  data.inbox=(data.inbox||[]).filter(x=>String(x.id)!==String(sourceId));
+  saveData();
+  return true;
+}
+
+/* Capture-dialog conversion path. */
+const v54asSaveCaptureBase=saveCapture;
+saveCapture=function(targetType=''){
+  if(targetType==='todo'||targetType==='project'){
+    const d=captureDraft();
+    if(d.type==='inbox'){
+      if(!d.name){document.getElementById('captureName')?.focus();return false;}
+      if(v54asFinishVerifiedInboxConversion(d.id,targetType,d)){
+        closeCaptureDialog();renderAll();showSaved(`Saved as ${targetType}`);return true;
+      }
+      return false;
+    }
+  }
+  return v54asSaveCaptureBase(targetType);
+};
+
+/* Three-dot Brain Inbox conversion path. */
+convertInbox=function(id,type){
+  const x=(data.inbox||[]).find(item=>String(item.id)===String(id));if(!x)return;
+  const draft={name:x.name,note:x.note||'',attachment:x.attachment||null};
+  if(type==='appointment'){
+    pendingInboxAppointmentId=id;
+    pendingInboxDraft={...draft,id,type:'inbox'};
+    openAppointmentDialog('',x.name,x.note||'');
+    v54asRenderAppointmentAttachment(x.attachment||null);
+    return;
+  }
+  if(type==='todo'||type==='project'){
+    if(v54asFinishVerifiedInboxConversion(id,type,draft)){
+      renderAll();showSaved('Thought converted');
+    }
+    return;
+  }
+  data.waiting.unshift({id:uid(),name:x.name,note:x.note||'',reviewDate:'',completed:false});
+  data.inbox=data.inbox.filter(item=>String(item.id)!==String(id));
+  saveData();renderAll();showSaved('Thought converted');
+};
+
+/* Appointment attachment preview. */
+window.v54asAppointmentAttachment=null;
+function v54asRenderAppointmentAttachment(attachment){
+  const area=document.getElementById('appointmentAttachmentPreview');
+  if(!area)return;
+  window.v54asAppointmentAttachment=attachment?.data?attachment:null;
+  if(!window.v54asAppointmentAttachment){
+    area.classList.add('hidden');area.innerHTML='';return;
+  }
+  const image=attachment.type?.startsWith('image/');
+  const visual=image
+    ? `<img src="${attachment.data}" alt="${escapeHtml(attachment.name||'Appointment attachment')}">`
+    : `<span class="attachment-file-icon" aria-hidden="true">📄</span>`;
+  area.innerHTML=`<button type="button" class="item-attachment-open" onclick="showAttachmentViewer(window.v54asAppointmentAttachment)" aria-label="Open appointment attachment">${visual}<span><strong>${escapeHtml(attachment.name||'Attachment')}</strong><small>${image?'Tap to view image':'Open attachment'}</small></span></button>`;
+  area.classList.remove('hidden');
+}
+
+const v54asOpenAppointmentBase=openAppointmentDialog;
+openAppointmentDialog=function(id='',prefillName='',prefillNotes=''){
+  const result=v54asOpenAppointmentBase(id,prefillName,prefillNotes);
+  const existing=id?(data.appointments||[]).find(x=>String(x.id)===String(id)):null;
+  const pending=pendingInboxDraft?.attachment||null;
+  v54asRenderAppointmentAttachment(existing?.attachment||pending||null);
+  return result;
+};
+
+const v54asCloseAppointmentBase=closeAppointmentDialog;
+closeAppointmentDialog=function(){
+  window.v54asAppointmentAttachment=null;
+  const area=document.getElementById('appointmentAttachmentPreview');
+  if(area){area.classList.add('hidden');area.innerHTML='';}
+  return v54asCloseAppointmentBase();
+};
+
+/* Outermost appointment save guard. Capture the attachment before earlier
+   wrappers clear pendingInboxDraft/pendingInboxAppointmentId. */
+const v54asSaveAppointmentBase=saveAppointment;
+saveAppointment=function(){
+  const sourceId=String(pendingInboxAppointmentId||'');
+  const source=(data.inbox||[]).find(x=>String(x.id)===sourceId);
+  const pendingAttachment=v54asCloneAttachment(source?.attachment||pendingInboxDraft?.attachment||window.v54asAppointmentAttachment||null);
+  const existingId=String(document.getElementById('appointmentId')?.value||'');
+  const beforeIds=new Set((data.appointments||[]).map(x=>String(x.id)));
+  const result=v54asSaveAppointmentBase();
+  if(!result)return result;
+
+  let savedAppointment=null;
+  if(existingId)savedAppointment=(data.appointments||[]).find(x=>String(x.id)===existingId);
+  if(!savedAppointment)savedAppointment=(data.appointments||[]).find(x=>!beforeIds.has(String(x.id)))||(data.appointments||[])[0];
+
+  if(pendingAttachment&&savedAppointment){
+    savedAppointment.attachment=pendingAttachment;
+    saveData();
+    if(!v54asAttachmentIntact(savedAppointment,pendingAttachment)){
+      alert('The appointment saved, but its attachment could not be verified. The original Brain Inbox item has not been intentionally removed by this repair.');
+    }
+  }
+  renderAll();
+  return result;
+};
+
+/* List-level attachment cues. */
+function v54asAttachmentCue(item){
+  if(!item?.attachment?.data)return '';
+  return item.attachment.type?.startsWith('image/')?' · 🖼 Image':' · 📎 Attachment';
+}
+
+const v54asRenderTodosBase=renderTodos;
+renderTodos=function(){
+  v54asRenderTodosBase();
+  const area=document.getElementById('todoArea');
+  if(area){
+    const topRows=[...area.children].filter(row=>row.classList.contains('compact-manage-row')&&!row.classList.contains('nested-compact-row'));
+    const sorted=[...(data.todos||[])].sort(sortByDueDate);
+    sorted.forEach((todo,index)=>{
+      const meta=topRows[index]?.querySelector('.compact-row-meta');
+      if(meta&&todo.attachment?.data&&!meta.textContent.includes('🖼')&&!meta.textContent.includes('📎')){
+        meta.textContent+=v54asAttachmentCue(todo);
+      }
+    });
+  }
+  v54asUpdateTodoCleanup();
+};
+
+const v54asRenderAppointmentsBase=renderAppointments;
+renderAppointments=function(){
+  v54asRenderAppointmentsBase();
+  const cards=[...document.querySelectorAll('#appointmentsArea .appointment-card')];
+  const sorted=[...(data.appointments||[])].sort((a,b)=>((a.date||'')+(a.time||'')).localeCompare((b.date||'')+(b.time||'')));
+  sorted.forEach((appt,index)=>{
+    const meta=cards[index]?.querySelector('.appointment-meta');
+    if(meta&&appt.attachment?.data&&!meta.textContent.includes('🖼')&&!meta.textContent.includes('📎')){
+      meta.textContent+=v54asAttachmentCue(appt);
+    }
+  });
+};
+
+/* Completed To-do retention/cleanup. */
+function v54asTodoCleanupCutoff(now=new Date()){
+  const cutoff=new Date(now);
+  cutoff.setHours(23,59,59,999);
+  cutoff.setMonth(cutoff.getMonth()-2);
+  return cutoff;
+}
+function v54asOldCompletedTodos(){
+  const cutoff=v54asTodoCleanupCutoff();
+  return (data.todos||[]).filter(todo=>{
+    if(!todo?.completed||!todo.completedAt)return false;
+    const when=new Date(todo.completedAt);
+    return !Number.isNaN(when.getTime())&&when<cutoff;
+  });
+}
+function v54asUpdateTodoCleanup(){
+  const button=document.getElementById('deleteOldCompletedTodosButton');
+  const status=document.getElementById('oldCompletedTodosStatus');
+  if(!button||!status)return;
+  const eligible=v54asOldCompletedTodos();
+  button.disabled=!eligible.length;
+  button.textContent=eligible.length
+    ? `Delete completed older than 2 months (${eligible.length})`
+    : 'Delete completed older than 2 months';
+  status.textContent=eligible.length
+    ? `${eligible.length} completed to-do${eligible.length===1?' is':'s are'} eligible for cleanup.`
+    : 'No completed to-dos with a recorded completion date are older than 2 months.';
+}
+function deleteCompletedTodosOlderThanTwoMonths(){
+  const eligible=v54asOldCompletedTodos();
+  if(!eligible.length){v54asUpdateTodoCleanup();return;}
+  const names=eligible.slice(0,4).map(x=>x.name||'Untitled to-do');
+  const more=eligible.length>4?` and ${eligible.length-4} more`:'';
+  if(!confirm(`Delete ${eligible.length} completed to-do${eligible.length===1?'':'s'} older than 2 months?\n\n${names.join('\n')}${more}\n\nThis removes them from the planner and future recovery snapshots. Existing recovery snapshots will age out normally.`))return;
+  const ids=new Set(eligible.map(x=>String(x.id)));
+  data.todos=(data.todos||[]).filter(x=>!ids.has(String(x.id)));
+  saveData();renderAll();showSaved(`${eligible.length} old completed to-do${eligible.length===1?'':'s'} deleted`);
+}
+
+/* Ensure future completed ordinary To-dos always carry a usable completion date. */
+const v54asToggleTodoBase=toggleTodo;
+toggleTodo=function(id){
+  const item=(data.todos||[]).find(x=>String(x.id)===String(id));
+  const was=Boolean(item?.completed);
+  v54asToggleTodoBase(id);
+  if(item&&!was&&item.completed&&!item.completedAt){
+    item.completedAt=new Date().toISOString();saveData();
+  }
+  if(item&&was&&!item.completed&&item.completedAt){
+    item.completedAt=null;saveData();
+  }
+  v54asUpdateTodoCleanup();
+};
+
+
+/* ===== v54at Home Recurring preview =====
+   Presentation-only Home change:
+   - overdue recurring tasks first
+   - due-today recurring tasks next
+   - then up to three upcoming active recurring tasks
+   Lists and recurrence calculations remain unchanged. */
+
+function v54atRecurringHomeBuckets(){
+  const today=localDateKey();
+  const active=(data.recurringTasks||[]).filter(item=>item && !item.paused && !item.completed && item.nextDueDate);
+  const overdue=active
+    .filter(item=>item.nextDueDate<today)
+    .sort((a,b)=>String(a.nextDueDate).localeCompare(String(b.nextDueDate)));
+  const dueToday=active
+    .filter(item=>item.nextDueDate===today)
+    .sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const upcoming=active
+    .filter(item=>item.nextDueDate>today)
+    .sort((a,b)=>{
+      const byDate=String(a.nextDueDate).localeCompare(String(b.nextDueDate));
+      return byDate||String(a.name||'').localeCompare(String(b.name||''));
+    })
+    .slice(0,3);
+  return {overdue,dueToday,upcoming};
+}
+
+function v54atRecurringHomeMeta(item){
+  const today=localDateKey();
+  if(item.nextDueDate<today)return `Overdue · ${formatDate(item.nextDueDate)}`;
+  if(item.nextDueDate===today)return 'Due today';
+  return `Upcoming · ${formatDate(item.nextDueDate)}`;
+}
+
+function v54atRenderRecurringHomeRow(item){
+  const row=makeV10Row(
+    {
+      name:item.name||'Untitled recurring task',
+      meta:v54atRecurringHomeMeta(item),
+      dueDate:item.nextDueDate||'',
+      open:()=>openRecurringDialog(item.id)
+    },
+    {
+      complete:true,
+      completed:false,
+      completeAction:()=>completeRecurringTask(item.id),
+      menu:typeof recurringTaskMenu==='function'?recurringTaskMenu(item):''
+    }
+  );
+  return row;
+}
+
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');
+  if(!area)return;
+  area.innerHTML='';
+  const {overdue,dueToday,upcoming}=v54atRecurringHomeBuckets();
+
+  if(!overdue.length&&!dueToday.length&&!upcoming.length){
+    area.innerHTML='<div class="empty-state">No active recurring tasks.</div>';
+    return;
+  }
+
+  const appendSection=(title,items,className='')=>{
+    if(!items.length)return;
+    const section=document.createElement('div');
+    section.className=`home-recurring-group ${className}`.trim();
+    const heading=document.createElement('div');
+    heading.className='home-recurring-group-title';
+    heading.textContent=title;
+    section.appendChild(heading);
+    items.forEach(item=>section.appendChild(v54atRenderRecurringHomeRow(item)));
+    area.appendChild(section);
+  };
+
+  appendSection('Overdue',overdue,'home-recurring-overdue');
+  appendSection('Due today',dueToday,'home-recurring-today');
+  appendSection('Upcoming',upcoming,'home-recurring-upcoming');
+};
+
+const v54atRenderAllBase=renderAll;
+renderAll=function(){
+  const result=v54atRenderAllBase.apply(this,arguments);
+  try{renderRecurringHome();}catch(error){console.error('v54at recurring Home refresh',error);}
+  return result;
+};
+
+setTimeout(()=>{try{renderRecurringHome();}catch(error){console.error('v54at recurring Home initial render',error);}},520);
+window.addEventListener('pageshow',()=>setTimeout(()=>{try{renderRecurringHome();}catch(error){console.error('v54at recurring Home pageshow',error);}},150));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(()=>{try{renderRecurringHome();}catch(error){console.error('v54at recurring Home visibility',error);}},150);});
+
+
+/* ===== v54au Recurring Home repair =====
+   Repairs v54at Upcoming recurring display by using the established recurring
+   task model: nextDue + status, with v54jRecurringIsActive() for compatibility.
+   Recurrence calculations and Lists rendering are unchanged. */
+function v54auRecurringHomeBuckets(){
+  const today=recurringDate(localDateKey());
+  const active=(data.recurringTasks||[]).filter(item=>
+    v54jRecurringIsActive(item) && item.nextDue && recurringDate(item.nextDue)
+  );
+  const overdue=active
+    .filter(item=>recurringDate(item.nextDue)<today)
+    .sort((a,b)=>String(a.nextDue).localeCompare(String(b.nextDue)));
+  const dueToday=active
+    .filter(item=>recurringDate(item.nextDue).getTime()===today.getTime())
+    .sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const upcoming=active
+    .filter(item=>recurringDate(item.nextDue)>today)
+    .sort((a,b)=>{
+      const byDate=String(a.nextDue).localeCompare(String(b.nextDue));
+      return byDate||String(a.name||'').localeCompare(String(b.name||''));
+    })
+    .slice(0,3);
+  return {overdue,dueToday,upcoming};
+}
+function v54auRecurringHomeMeta(item){
+  const today=recurringDate(localDateKey());
+  const due=recurringDate(item.nextDue);
+  if(due<today)return `${recurringPatternLabel(item)} · Overdue · ${formatDate(item.nextDue)}`;
+  if(due.getTime()===today.getTime())return `${recurringPatternLabel(item)} · Due today`;
+  return `${recurringPatternLabel(item)} · Upcoming · ${formatDate(item.nextDue)}`;
+}
+function v54auRenderRecurringHomeRow(item){
+  const menu=compactMenu(
+    `<button onclick="closeAnchoredMenu();openRecurringTaskDialog('${item.id}')">Edit</button>`+
+    `<button onclick="closeAnchoredMenu();completeRecurringTask('${item.id}')">Complete</button>`+
+    `<button onclick="closeAnchoredMenu();toggleRecurringPause('${item.id}')">Pause</button>`,
+    item.name||'recurring task'
+  );
+  return makeV10Row({
+    name:item.name||'Untitled recurring task',
+    meta:v54auRecurringHomeMeta(item),
+    dueDate:item.nextDue||'',
+    action:()=>completeRecurringTask(item.id),
+    open:()=>openRecurringTaskDialog(item.id)
+  },{menu});
+}
+renderRecurringHome=function(){
+  const area=document.getElementById('homeRecurringArea');
+  if(!area)return;
+  area.innerHTML='';
+  const {overdue,dueToday,upcoming}=v54auRecurringHomeBuckets();
+  if(!overdue.length&&!dueToday.length&&!upcoming.length){
+    area.innerHTML='<div class="empty-state">No active recurring tasks.</div>';
+    return;
+  }
+  const appendSection=(title,items,className='')=>{
+    if(!items.length)return;
+    const section=document.createElement('div');
+    section.className=`home-recurring-group ${className}`.trim();
+    const heading=document.createElement('div');
+    heading.className='home-recurring-group-title';
+    heading.textContent=title;
+    section.appendChild(heading);
+    items.forEach(item=>section.appendChild(v54auRenderRecurringHomeRow(item)));
+    area.appendChild(section);
+  };
+  appendSection('Overdue',overdue,'home-recurring-overdue');
+  appendSection('Due today',dueToday,'home-recurring-today');
+  appendSection('Upcoming',upcoming,'home-recurring-upcoming');
+};
+function v54auRefreshRecurringHome(){
+  try{renderRecurringHome();}catch(error){console.error('v54au recurring Home refresh',error);}
+}
+setTimeout(v54auRefreshRecurringHome,600);
+window.addEventListener('pageshow',()=>setTimeout(v54auRefreshRecurringHome,180));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54auRefreshRecurringHome,180);});
+
+
+/* ===== v54aw Lists repair =====
+   Built from accepted v54au, not rejected v54av.
+   - Replaces the actual renderCustomLists() five-item preview with a complete,
+     collapsible Custom List view.
+   - Makes empty globalListSearch authoritative and restores every Lists section.
+   - Does not alter Today / appointment logic. */
+
+const V54AW_CUSTOM_LIST_STATE_KEY='myLifePlannerCustomListExpandedV54aw';
+
+function v54awCustomListStates(){
+  try{return JSON.parse(localStorage.getItem(V54AW_CUSTOM_LIST_STATE_KEY)||'{}')||{};}
+  catch(_){return {};}
+}
+function v54awSetCustomListExpanded(id,expanded){
+  const states=v54awCustomListStates();
+  states[String(id)]=Boolean(expanded);
+  try{localStorage.setItem(V54AW_CUSTOM_LIST_STATE_KEY,JSON.stringify(states));}catch(_){}
+}
+function v54awToggleCustomList(id){
+  const card=document.querySelector(`.custom-list-card[data-custom-list-id="${CSS.escape(String(id))}"]`);
+  if(!card)return;
+  const body=card.querySelector('.v54aw-custom-list-body');
+  const toggle=card.querySelector('.v54aw-custom-list-toggle');
+  if(!body||!toggle)return;
+  const opening=body.hidden;
+  body.hidden=!opening;
+  toggle.setAttribute('aria-expanded',String(opening));
+  const arrow=toggle.querySelector('.v54aw-custom-list-arrow');
+  if(arrow)arrow.textContent=opening?'▾':'▸';
+  v54awSetCustomListExpanded(id,opening);
+}
+window.v54awToggleCustomList=v54awToggleCustomList;
+
+/* Authoritative Custom Lists renderer: no slice()/preview limit. */
+renderCustomLists=function(){
+  const area=document.getElementById('customListsArea');
+  if(!area)return;
+  area.innerHTML='';
+  const lists=data.customLists||[];
+  if(!lists.length){
+    area.innerHTML='<div class="empty-state">No custom lists yet. Create one for shopping, packing, ideas or anything else.</div>';
+    return;
+  }
+
+  const states=v54awCustomListStates();
+
+  lists.forEach(list=>{
+    const items=[...(list.items||[])].sort((x,y)=>
+      Number(Boolean(x.completed))-Number(Boolean(y.completed)) ||
+      String(x.name||'').localeCompare(String(y.name||''))
+    );
+    const expanded=states[String(list.id)]!==false;
+
+    const card=document.createElement('article');
+    card.className='custom-list-card';
+    card.dataset.customListId=String(list.id);
+    card.dataset.listName=list.name||'';
+
+    const heading=document.createElement('div');
+    heading.className='custom-list-heading';
+    heading.innerHTML=
+      `<button type="button" class="v54aw-custom-list-toggle" aria-expanded="${expanded}" onclick="v54awToggleCustomList('${list.id}')">`+
+        `<span class="v54aw-custom-list-arrow" aria-hidden="true">${expanded?'▾':'▸'}</span>`+
+        `<span><strong>${escapeHtml(list.name||'Untitled list')}</strong><small>${items.length} item${items.length===1?'':'s'}</small></span>`+
+      `</button>`+
+      `<button type="button" class="small-button" onclick="openCustomListManager('${list.id}')">Manage</button>`;
+    card.appendChild(heading);
+
+    const body=document.createElement('div');
+    body.className='stack-list v54aw-custom-list-body';
+    body.hidden=!expanded;
+
+    if(!items.length){
+      body.innerHTML='<div class="empty-state">This list is empty.</div>';
+    }else{
+      items.forEach(item=>{
+        const button=document.createElement('button');
+        button.type='button';
+        button.className=`custom-preview-item ${item.completed?'completed-row':''}`;
+        button.onclick=()=>toggleCustomListItem(list.id,item.id);
+        button.setAttribute('aria-label',`${item.completed?'Mark active':'Complete'} ${item.name||'item'}`);
+        button.innerHTML=
+          `<span>${item.completed?'✓':'○'}</span>`+
+          `<span>${escapeHtml(item.name||'Untitled item')}</span>`;
+        body.appendChild(button);
+      });
+    }
+
+    card.appendChild(body);
+    area.appendChild(card);
+  });
+};
+
+/* Empty Lists search must always mean "show everything".
+   This runs after the older 90ms search debounce so stale filtering cannot win. */
+function v54awForceClearListsSearch(){
+  const search=document.getElementById('globalListSearch');
+  if(search && normaliseSearchText(search.value))return false;
+  if(search)search.value='';
+
+  const status=document.getElementById('listSearchStatus');
+  if(status)status.textContent='';
+
+  const projectStates=typeof getProjectStepStates==='function'?getProjectStepStates():{};
+
+  document.querySelectorAll('.managed-list-section').forEach(section=>{
+    section.hidden=false;
+    section.classList.remove('list-search-hidden');
+
+    section.querySelectorAll(
+      '.compact-manage-row,.annual-manage-row,.list-card,.v10-row,.custom-list-card,.custom-preview-item,.step-compact-row,.appointment-card'
+    ).forEach(row=>{
+      row.hidden=false;
+      row.classList.remove('list-search-hidden');
+      row.removeAttribute('data-search-score');
+    });
+
+    section.querySelectorAll('.project-steps-group').forEach(group=>{
+      group.hidden=!projectStates[group.dataset.projectId];
+    });
+  });
+
+  return true;
+}
+window.v54awForceClearListsSearch=v54awForceClearListsSearch;
+
+const v54awFilterMyListsBase=filterMyLists;
+filterMyLists=function(query=''){
+  const search=document.getElementById('globalListSearch');
+  const raw=String(query ?? search?.value ?? '');
+  if(!normaliseSearchText(raw)){
+    v54awForceClearListsSearch();
+    return;
+  }
+  return v54awFilterMyListsBase(raw);
+};
+
+function v54awAttachSearchClear(){
+  const search=document.getElementById('globalListSearch');
+  if(!search||search.dataset.v54awClearReady==='true')return;
+  search.dataset.v54awClearReady='true';
+
+  const clearIfEmpty=()=>{
+    if(normaliseSearchText(search.value))return;
+    v54awForceClearListsSearch();
+    setTimeout(v54awForceClearListsSearch,110);
+    setTimeout(v54awForceClearListsSearch,180);
+  };
+
+  search.addEventListener('input',clearIfEmpty);
+  search.addEventListener('search',clearIfEmpty);
+  search.addEventListener('change',clearIfEmpty);
+  search.addEventListener('keyup',clearIfEmpty);
+}
+setTimeout(v54awAttachSearchClear,350);
+window.addEventListener('pageshow',()=>setTimeout(v54awAttachSearchClear,120));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54awAttachSearchClear,120);});
+
+
+/* ===== v54ax desktop updater/cache repair =====
+   Updater-only change. All v54aw planner feature code above is unchanged. */
+(function(){
+  const refreshKey=`mlp-controller-refresh-${APP_VERSION}`;
+  if(!('serviceWorker' in navigator))return;
+  function reloadOnce(){
+    try{
+      if(sessionStorage.getItem(refreshKey)==='1')return;
+      sessionStorage.setItem(refreshKey,'1');
+    }catch(_){}
+    location.reload();
+  }
+  window.addEventListener('load',async()=>{
+    try{
+      const reg=await navigator.serviceWorker.register(plannerWorkerUrl(APP_VERSION),{updateViaCache:'none'});
+      await reg.update();
+      if(reg.waiting)reg.waiting.postMessage({type:'SKIP_WAITING'});
+      navigator.serviceWorker.addEventListener('controllerchange',reloadOnce,{once:true});
+      if(!navigator.serviceWorker.controller)setTimeout(reloadOnce,500);
+    }catch(error){console.error('v54ax desktop update repair',error);}
+  },{once:true});
+})();
+
+
+/* ===== v54ay Today's Progress =====
+   Replaces the old all-time To-do + routine calculation with a deliberately
+   day-scoped measure. Appointments and routines are excluded.
+
+   Eligible today:
+   - ordinary To-dos due today/overdue and not Pending
+   - Today's Focus items for today
+   - project steps due today/overdue and not Pending
+   - recurring tasks due today/overdue
+   Completed-today records remain in the denominator so progress cannot shrink
+   simply because an item was completed. */
+const V54AY_PROGRESS_VISIBLE_KEY='myLifePlannerShowTodayProgress';
+function v54ayDateFromStamp(value){return value?String(value).slice(0,10):'';}
+function v54ayDueTodayOrEarlier(value){return Boolean(value)&&String(value).slice(0,10)<=localDateKey();}
+function v54ayCompletedToday(item){return Boolean(item?.completed)&&v54ayDateFromStamp(item?.completedAt)===localDateKey();}
+function v54ayProgressCounts(){
+  const today=localDateKey();
+  let total=0,completed=0;
+
+  (data.todos||[]).forEach(item=>{
+    if(item?.pending)return;
+    const eligibleOpen=!item.completed&&v54ayDueTodayOrEarlier(item.dueDate);
+    const eligibleDone=v54ayCompletedToday(item)&&v54ayDueTodayOrEarlier(item.dueDate);
+    if(eligibleOpen||eligibleDone){total++;if(eligibleDone)completed++;}
+  });
+
+  (data.todayFocus||[]).forEach(item=>{
+    if(String(item?.forDate||today)!==today)return;
+    total++;
+    if(item.completed)completed++;
+  });
+
+  (data.projects||[]).forEach(project=>{
+    (project.steps||[]).forEach(step=>{
+      if(step?.pending)return;
+      const eligibleOpen=!step.completed&&v54ayDueTodayOrEarlier(step.dueDate);
+      const eligibleDone=v54ayCompletedToday(step)&&v54ayDueTodayOrEarlier(step.dueDate);
+      if(eligibleOpen||eligibleDone){total++;if(eligibleDone)completed++;}
+    });
+  });
+
+  (data.recurringTasks||[]).forEach(task=>{
+    if(!v54jRecurringIsActive(task))return;
+    const doneToday=v54ayDateFromStamp(task.lastCompleted)===today;
+    const dueNow=v54ayDueTodayOrEarlier(task.nextDue);
+    if(dueNow||doneToday){total++;if(doneToday)completed++;}
+  });
+  return {completed,total};
+}
+function v54ayProgressVisible(){
+  try{return localStorage.getItem(V54AY_PROGRESS_VISIBLE_KEY)!=='false';}catch(_){return true;}
+}
+function v54aySetProgressVisible(visible){
+  try{localStorage.setItem(V54AY_PROGRESS_VISIBLE_KEY,String(Boolean(visible)));}catch(_){}
+  v54ayApplyProgressVisibility();
+}
+function v54ayApplyProgressVisibility(){
+  const panel=document.getElementById('todayProgressPanel');
+  const showButton=document.getElementById('showTodayProgressButton');
+  const visible=v54ayProgressVisible();
+  if(panel)panel.hidden=!visible;
+  if(showButton)showButton.hidden=visible;
+}
+window.v54aySetProgressVisible=v54aySetProgressVisible;
+
+updateProgress=function(){
+  const {completed,total}=v54ayProgressCounts();
+  const percent=total?Math.round(completed/total*100):0;
+  const bar=document.getElementById('progressBar');
+  const text=document.getElementById('progressText');
+  if(bar)bar.style.width=`${percent}%`;
+  if(text)text.textContent=`${completed} of ${total}`;
+  v54ayApplyProgressVisibility();
+};
+
+/* Ensure completion timestamps needed by the day-scoped calculation exist for
+   project steps, without changing their existing completion behaviour. */
+const v54ayToggleStepBase=toggleStep;
+toggleStep=function(projectId,stepId){
+  const project=(data.projects||[]).find(x=>String(x.id)===String(projectId));
+  const step=project?.steps?.find(x=>String(x.id)===String(stepId));
+  const was=Boolean(step?.completed);
+  v54ayToggleStepBase(projectId,stepId);
+  if(step&&!was&&step.completed&&!step.completedAt){step.completedAt=new Date().toISOString();saveData();}
+  if(step&&was&&!step.completed&&step.completedAt){step.completedAt=null;saveData();}
+  updateProgress();
+};
+
+const v54ayToggleTodayFocusBase=toggleTodayFocusItem;
+toggleTodayFocusItem=function(id){v54ayToggleTodayFocusBase(id);updateProgress();};
+const v54ayDeleteTodayFocusBase=deleteTodayFocusItem;
+deleteTodayFocusItem=function(id){v54ayDeleteTodayFocusBase(id);updateProgress();};
+const v54ayClearTodayFocusBase=clearCompletedTodayFocus;
+clearCompletedTodayFocus=function(){v54ayClearTodayFocusBase();updateProgress();};
+const v54ayCompleteRecurringBase=completeRecurringTask;
+completeRecurringTask=function(id){v54ayCompleteRecurringBase(id);updateProgress();};
+
+setTimeout(()=>{updateProgress();v54ayApplyProgressVisibility();},650);
+window.addEventListener('pageshow',()=>setTimeout(updateProgress,160));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(updateProgress,160);});
+
+/* ===== v54ba Appointment display repair =====
+   Built from confirmed v54ay, not rejected v54az.
+
+   The actual Home/weekly appointment checkbox came from compactReminderRow():
+   v54jReminderRow() was passing appointments as actionable even though
+   completionFor(appointment) returns null. That created a checkbox which could
+   visually tick but never persisted any appointment state.
+
+   Make appointment reminder rows non-actionable at the shared renderer itself,
+   and give them a real class used for visual styling. This affects every
+   compact-reminder rendering route consistently, including Home Today and
+   weekly/reminder views. Timeline and Lists have their own appointment classes.
+*/
+const v54baCompactReminderRowBase=compactReminderRow;
+compactReminderRow=function(item,options={}){
+  const isAppointment=item?.itemType==='appointment';
+  const safeOptions=isAppointment
+    ? {...options, actionable:false, onComplete:null}
+    : options;
+  const row=v54baCompactReminderRowBase(item,safeOptions);
+  if(isAppointment) row.classList.add('appointment-reminder-row');
+  return row;
+};
+
+/* Re-render after the authoritative shared-row override is installed. */
+try{renderTodayReminders();}catch(error){console.error('v54ba appointment Home refresh',error);}
+try{renderWeekly();}catch(error){console.error('v54ba appointment weekly refresh',error);}
+
+/* ===== v54bd Progress controls + Time Sensitive ordering repair =====
+   Built from confirmed v54ba.
+
+   Progress root cause:
+   index.html was calling v54baSetProgressVisible(), but the real function is
+   v54aySetProgressVisible(). The handlers are corrected in index.html.
+
+   Time Sensitive:
+   preserve the confirmed v54ba renderer and appointment inclusion unchanged.
+   Only replace the sort key used by the existing comparator. */
+v54vTodaySortKey=function(item){
+  const todayKey=localDateKey();
+  const dueKey=item?.dueDate?recurringDateKey(dateOnly(item.dueDate)):'';
+
+  /* 0 = every overdue item, regardless of type */
+  if(dueKey && dueKey<todayKey) return [0,dueKey,''];
+
+  /* 1 = appointments due today, timed appointments ordered by saved time */
+  if(dueKey===todayKey && item?.itemType==='appointment')
+    return [1,dueKey,item?.time?String(item.time):'99:99'];
+
+  /* 3 = project steps due today; activeProjectDashboardItems identifies these
+     as itemType "step" with source "Project: …". */
+  if(dueKey===todayKey && item?.itemType==='step' &&
+     String(item?.source||'').startsWith('Project:'))
+    return [3,dueKey,''];
+
+  /* 2 = all other current time-sensitive items (and reminder-window items). */
+  return [2,dueKey,''];
+};
+
+try{renderTodayReminders();}catch(error){console.error('v54bd Today ordering refresh',error);}
+
+/* ===== v54bh Daily Thought stable-baseline test ===== */
+const V54BH_DAILY_THOUGHTS=[{"q": "Nothing great was ever achieved without enthusiasm.", "a": "Ralph Waldo Emerson", "s": "Essays: Second Series (1844)"}, {"q": "The only way to have a friend is to be one.", "a": "Ralph Waldo Emerson", "s": "Essays: First Series (1841)"}, {"q": "Nothing can bring you peace but yourself.", "a": "Ralph Waldo Emerson", "s": "Essays: First Series (1841)"}, {"q": "Well done is better than well said.", "a": "Benjamin Franklin", "s": "Poor Richard's Almanack (1737)"}, {"q": "Lost time is never found again.", "a": "Benjamin Franklin", "s": "Poor Richard's Almanack (1748)"}, {"q": "Rather than love, than money, than fame, give me truth.", "a": "Henry David Thoreau", "s": "Walden (1854)"}, {"q": "There is nothing either good or bad, but thinking makes it so.", "a": "William Shakespeare", "s": "Hamlet (c. 1600)"}, {"q": "Our doubts are traitors, and make us lose the good we oft might win.", "a": "William Shakespeare", "s": "Measure for Measure (c. 1604)"}, {"q": "Wisely, and slow. They stumble that run fast.", "a": "William Shakespeare", "s": "Romeo and Juliet (c. 1595)"}, {"q": "This above all: to thine own self be true.", "a": "William Shakespeare", "s": "Hamlet (c. 1600)"}, {"q": "Forever is composed of nows.", "a": "Emily Dickinson", "s": "Poem 690, published 1891"}, {"q": "If I can stop one heart from breaking, I shall not live in vain.", "a": "Emily Dickinson", "s": "Poem 919, published 1890"}, {"q": "Do anything, but let it produce joy.", "a": "Walt Whitman", "s": "Leaves of Grass (1855/1892)"}, {"q": "What do we live for, if it is not to make life less difficult to each other?", "a": "George Eliot", "s": "Middlemarch (1871–72)"}, {"q": "The art of being wise is the art of knowing what to overlook.", "a": "William James", "s": "The Principles of Psychology (1890)"}];
+function v54bhThoughtIndex(dateKey){
+ let hash=2166136261;for(const ch of String(dateKey||'')){hash^=ch.charCodeAt(0);hash=Math.imul(hash,16777619);}
+ return (hash>>>0)%V54BH_DAILY_THOUGHTS.length;
+}
+function v54bhRenderDailyThought(){
+ const panel=document.getElementById('dailyThoughtAnchor'); if(!panel)return;
+ let card=document.getElementById('dailyThoughtCard');
+ if(!card){card=document.createElement('div');card.id='dailyThoughtCard';card.className='daily-thought-card';panel.appendChild(card);}
+ const thought=V54BH_DAILY_THOUGHTS[v54bhThoughtIndex(localDateKey())];
+ card.innerHTML=`<div class="daily-thought-label">Thought for the day</div><blockquote>“${escapeHtml(thought.q)}”</blockquote><div class="daily-thought-author">— ${escapeHtml(thought.a)}</div>`;
+ card.hidden=false; /* Daily Thought stays visible all day */
+}
+const v54bhPlaceDaypartBase=v54alPlaceDaypartRoutine;
+v54alPlaceDaypartRoutine=function(){const result=v54bhPlaceDaypartBase.apply(this,arguments);v54bhRenderDailyThought();return result;};
+setTimeout(v54bhRenderDailyThought,220);
+
+/* ===== v54bj Home / Lists regression repair ===== */
+const V54BJ_LISTS_ONLY_SECTION_IDS=[
+  'todoListSection','appointmentsListSection','recurringTasksListSection',
+  'inboxListSection','waitingListSection','annualListSection',
+  'projectsListSection','cleaningListSection','customListsSection'
+];
+function v54bjEnforceHomeListsSeparation(){
+  const homeActive=document.getElementById('homeView')?.classList.contains('active') ||
+    document.querySelector('.app-view-section[data-view="home"]:not([hidden])');
+  if(!homeActive)return;
+  V54BJ_LISTS_ONLY_SECTION_IDS.forEach(id=>{
+    const section=document.getElementById(id);
+    if(section) section.hidden=true;
+  });
+}
+const v54bjShowAppViewBase=showAppView;
+showAppView=function(view){
+  const result=v54bjShowAppViewBase.apply(this,arguments);
+  if(view==='home'){
+    v54bjEnforceHomeListsSeparation();
+    requestAnimationFrame(v54bjEnforceHomeListsSeparation);
+    setTimeout(v54bjEnforceHomeListsSeparation,120);
+  }
+  return result;
+};
+window.showAppView=showAppView;
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)v54bjEnforceHomeListsSeparation();});
+window.addEventListener('pageshow',v54bjEnforceHomeListsSeparation);
+setTimeout(v54bjEnforceHomeListsSeparation,250);

@@ -1,0 +1,42 @@
+{
+  "name": "My Life Planner V54ay",
+  "short_name": "Life Planner",
+  "description": "A calm personal planner with a unified Timeline, Brain Inbox, lists, projects, routines and appointments.",
+  "start_url": "./index.html?v=54ay",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f8ff",
+  "theme_color": "#1769c2",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "id": "./",
+  "version": "54ay",
+  "shortcuts": [
+    {
+      "name": "Brain Inbox",
+      "short_name": "Brain Inbox",
+      "description": "Capture a thought in Brain Inbox",
+      "url": "./index.html?open=brain-inbox",
+      "icons": [
+        {
+          "src": "icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    }
+  ]
+}
