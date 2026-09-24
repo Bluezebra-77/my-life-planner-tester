@@ -1,23 +1,9 @@
-> Current hardening baseline: **v54n**
+# My Life Planner — Tester 1.1
 
-# My Life Planner v54a — Workflow & Stability
+Stable tester release based on Tester 1.0 planner behaviour, with the accepted Development v54bl First Use & Quick Start and refreshed Help Centre documentation promoted into the Tester channel.
 
-Upload every file in this folder to the root of the GitHub Pages repository, replacing the previous app files.
-
-Then open **Settings → App maintenance → Check for updates** and confirm **v54a** in the Header, About and Developer Dashboard.
-
-This release restores accepted Home ordering and collapse controls, recurring-task visibility and editing, Cleaning by Area entry controls, full project-step editing from Lists/search, consistent completion statistics and daily routine reset behaviour. Existing data keys and Convert-as-Move are preserved.
-
-Complete `TEST_CHECKLIST_v54a.md` before accepting the build.
-
-
-## v54a Project Templates
-Use Lists → Projects → Templates to create reusable workflows.
-
-
-## Protected Regression Gate
-From v54m onward, accepted workflows are behavioural contracts. Every release starts from the last accepted source, changes the minimum necessary code, and must pass `TEST_CHECKLIST_v54i.md` before it becomes the next golden baseline. Static syntax/package checks are necessary but are not sufficient for acceptance.
-
-
-## Ideas for later review
-- **Multi-device sync:** local-first synchronization across iPhone, iPad and laptop while retaining offline use; cloud/iCloud-style sync to be reviewed later.
+## Tester 1.1 documentation update
+- First Use & Quick Start is now an in-app HTML guide.
+- Return to My Life Planner appears at the top and bottom of First Use & Quick Start.
+- Help Centre is refreshed for the current Home / Lists / Timeline structure and has Return to My Life Planner at the top and bottom.
+- No planner data schema or core task workflow was intentionally changed from Tester 1.0.

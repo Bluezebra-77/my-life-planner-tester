@@ -28,7 +28,7 @@ const categoryNames = {};
 
 const choicePools = { normal: [], low: [], quick: [] };
 
-const APP_VERSION="T1.0";
+const APP_VERSION="T1.1";
 const SCHEMA_VERSION = 51;
 const DATABASE_VERSION = "2";
 const MIGRATION_BACKUP_KEY = "lifePlannerMigrationBackups";
