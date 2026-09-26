@@ -1,9 +1,5 @@
-# My Life Planner — Tester 1.1
+# My Life Planner Tester 1.2
 
-Stable tester release based on Tester 1.0 planner behaviour, with the accepted Development v54bl First Use & Quick Start and refreshed Help Centre documentation promoted into the Tester channel.
+Complete tester package promoted from the accepted Development line. Upload every file in this folder to the Tester site root, replacing the previous Tester files.
 
-## Tester 1.1 documentation update
-- First Use & Quick Start is now an in-app HTML guide.
-- Return to My Life Planner appears at the top and bottom of First Use & Quick Start.
-- Help Centre is refreshed for the current Home / Lists / Timeline structure and has Return to My Life Planner at the top and bottom.
-- No planner data schema or core task workflow was intentionally changed from Tester 1.0.
+Tester 1.2 includes Timeline Schedule filtering, Brain Inbox protected attachment storage, self-contained manual and automatic backups, and the in-app Help / Quick Start material. It is isolated from the Development channel and must start without personal seeded planner data.

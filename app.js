@@ -1,3 +1,4 @@
+const TESTER_CHANNEL=true;
 
 /* ===== v51b tags and advanced recurrence helpers ===== */
 function normaliseTags(value){
@@ -18,17 +19,46 @@ var TIMELINE_TYPES={
   cleaning:{icon:'🧹',label:'Cleaning'},annual:{icon:'🎂',label:'Birthday / annual date'},waiting:{icon:'⏳',label:'Pending note'}
 };
 
-const dailyTasks = [];
+const dailyTasks = [
+  { id: "wake", title: "Get up, wash and get dressed", time: "Around 7:00-8:00, depending on sleep and health" },
+  { id: "coffee", title: "Coffee, breakfast and medication", time: "About 30 minutes" },
+  { id: "emails", title: "Check important emails only", time: "15 minutes" },
+  { id: "plan", title: "Look at today and choose one main focus", time: "5 minutes" },
+  { id: "main", title: "Do one main morning task", time: "45-90 minutes while energy is best" },
+  { id: "break", title: "Take a proper break", time: "Tea, food, sit down or fresh air" },
+  { id: "computer", title: "Afternoon computer work", time: "30-60 minutes" },
+  { id: "small", title: "Complete one small household task", time: "10-20 minutes only" }
+];
 
-const eveningTasks = [];
+const eveningTasks = [
+  { id: "clear", title: "Clear one small surface", time: "5-10 minutes" },
+  { id: "tomorrow", title: "Note tomorrow's most important task", time: "2 minutes" },
+  { id: "stop", title: "Give myself permission to stop", time: "Rest counts" }
+];
 
-const defaultCategories = {};
+const defaultCategories = {
+  photography: ["Go out for a short photography trip", "Edit five photographs", "Practise ICM or multiple exposure", "Review images from the last outing", "Watch one photography lesson"],
+  decluttering: ["Declutter one drawer", "Sort one shelf", "Fill one charity bag", "Sort one small box", "Clear one visible surface"],
+  vinted: ["Choose three items to sell", "Photograph three items", "Write one listing", "Publish prepared listings", "Answer messages"],
+  admin: ["Sort one paperwork pile", "File five documents", "Reply to one important email", "Unsubscribe from unwanted emails", "Check one bill or appointment"],
+  house: ["Bathroom: one small decorating job", "Kitchen: clear one area", "Living room: tidy one zone", "Office room: clear one work area", "Front shed: sort one box"]
+};
 
-const categoryNames = {};
+const categoryNames = {
+  photography: "Photography",
+  decluttering: "Decluttering",
+  vinted: "Vinted",
+  admin: "Admin",
+  house: "House"
+};
 
-const choicePools = { normal: [], low: [], quick: [] };
+const choicePools = {
+  normal: ["Edit five photographs.", "Sort one drawer or shelf.", "Photograph three Vinted items.", "Deal with one important email or letter.", "Clear one small visible area.", "Take a short photo walk."],
+  low: ["Delete ten unwanted photographs.", "Put away five things.", "Unsubscribe from three unwanted emails.", "Choose one Vinted item to list later.", "Make a drink and note tomorrow's first task."],
+  quick: ["Clear one chair or small surface.", "File or shred five pieces of paper.", "Edit one photograph.", "Choose one item for Vinted.", "Set a 10-minute timer and tidy."]
+};
 
-const APP_VERSION="T1.1";
+const APP_VERSION="T1.2";
 const SCHEMA_VERSION = 51;
 const DATABASE_VERSION = "2";
 const MIGRATION_BACKUP_KEY = "lifePlannerMigrationBackups";
@@ -318,11 +348,16 @@ function saveData() {
     localStorage.setItem("lifePlannerTodayFocus", JSON.stringify(data.todayFocus || []));
     updateStorageStatus();
     showSaved();
+    return true;
   } catch (error) {
     console.error("Could not save planner data", error);
     const indicator = document.getElementById("saveIndicator");
     if (indicator) indicator.textContent = "Save failed — export a backup";
-    alert("The planner could not save. Please use Export backup and check that Safari is not in Private Browsing.");
+    const quota=error?.name==='QuotaExceededError'||error?.code===22||error?.code===1014;
+    alert(quota
+      ? "This item could not be saved because Safari's on-device planner storage is full. The item has been kept open so you can remove the attachment or make space, then try again. Please create an Export backup before deleting older items."
+      : "The planner could not save. The item has been kept open. Please use Export backup and check that Safari is not in Private Browsing.");
+    return false;
   }
 }
 
@@ -1388,6 +1423,7 @@ function renderAll() {
 let waitingServiceWorker = null;
 let plannerServiceWorkerRegistration = null;
 let plannerReloadingForUpdate = false;
+const PLANNER_RELOAD_GUARD_KEY='myLifePlannerUpdateReloadGuard';
 const PLANNER_VERSION_URL = './version.json';
 
 function plannerWorkerUrl(version=APP_VERSION) {
@@ -1452,15 +1488,24 @@ async function ensurePlannerServiceWorker() {
 
 function plannerReloadFresh(version='') {
   if (plannerReloadingForUpdate) return;
+  const target=String(version||APP_VERSION);
+  try{
+    const current=new URL(window.location.href);
+    const alreadyUpdated=current.searchParams.get('updated')||'';
+    const guard=sessionStorage.getItem(PLANNER_RELOAD_GUARD_KEY)||'';
+    // Once this page has already reloaded for the same target, do not enter a
+    // second controller/message-triggered reload cycle.
+    if(alreadyUpdated===target && guard===target){
+      sessionStorage.removeItem('myLifePlannerPendingVersion');
+      return;
+    }
+    sessionStorage.setItem(PLANNER_RELOAD_GUARD_KEY,target);
+  }catch(_){}
   plannerReloadingForUpdate=true;
   const url=new URL('./index.html',window.location.href);
-  url.searchParams.set('updated',version||APP_VERSION);
+  url.searchParams.set('updated',target);
   url.searchParams.set('_',Date.now().toString());
   window.location.replace(url.toString());
-
-  // If navigation is interrupted by an older controller/browser cache, permit
-  // another reload attempt rather than leaving the tab permanently locked.
-  setTimeout(()=>{plannerReloadingForUpdate=false;},5000);
 }
 
 async function activatePublishedPlanner(version) {
@@ -1542,6 +1587,10 @@ if ("serviceWorker" in navigator) {
   window.addEventListener('load',async()=>{
     try{
       const registration=await ensurePlannerServiceWorker();
+      try{
+        const loadedTarget=new URL(window.location.href).searchParams.get('updated')||'';
+        if(!loadedTarget)sessionStorage.removeItem(PLANNER_RELOAD_GUARD_KEY);
+      }catch(_){}
       if(registration?.waiting){
         waitingServiceWorker=registration.waiting;
         setUpdateButtonState('Update available');
@@ -1559,7 +1608,7 @@ if ("serviceWorker" in navigator) {
 
       // One network-only comparison on every load. If the deployment is newer,
       // apply it rather than merely advertising it.
-      /* Tester channel: updates are deliberate releases; no silent Development updates. */
+      /* Tester channel: updates are deliberate releases; no silent Development update check. */
     }catch(error){
       console.warn('Offline app registration failed',error);
     }
@@ -1948,12 +1997,20 @@ function saveCapture(targetType=''){
    pendingInboxDraft=d;
    closeCaptureDialog();openAppointmentDialog('',d.name,d.note);return true;
  }
+ const before=JSON.stringify(data);
  const type=targetType||d.type;
  if(type==='todo')data.todos.unshift({id:uid(),name:d.name,details:d.note,timingType:'none',dueDate:'',completed:false,steps:[],attachment:d.attachment||null,createdAt:new Date().toISOString()});
  else if(type==='project')data.projects.unshift({id:uid(),name:d.name,details:d.note,timingType:'none',dueDate:'',completed:false,steps:[],attachment:d.attachment||null,createdAt:new Date().toISOString()});
  else {const list=data[type]||(data[type]=[]),existing=list.find(x=>x.id===d.id);const record={id:existing?.id||uid(),name:d.name,note:d.note,reviewDate:type==='waiting'?d.reviewDate:'',category:type==='inbox'?d.category:'',status:type==='inbox'?d.status:'new',url:type==='inbox'?d.url:'',attachment:type==='inbox'?d.attachment:null,completed:existing?.completed||false,createdAt:existing?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};if(existing)Object.assign(existing,record);else list.unshift(record);}
  if(targetType&&d.type==='inbox'&&sourceItem)data.inbox=data.inbox.filter(x=>x.id!==d.id);
- saveData();closeCaptureDialog();renderAll();showSaved(targetType?`Saved as ${targetType==='waiting'?'Pending note':targetType}`:'Saved');return true;
+ const saved=saveData();
+ if(saved===false){
+   try{data=normaliseData(JSON.parse(before));}catch(error){console.error('Could not roll back failed Brain Inbox save',error);}
+   window.pendingBrainAttachment=d.attachment||null;
+   renderBrainAttachmentPreview();
+   return false;
+ }
+ closeCaptureDialog();renderAll();showSaved(targetType?`Saved as ${targetType==='waiting'?'Pending note':targetType}`:'Saved');return true;
 }
 function saveCaptureAs(type){saveCapture(type);}
 function inboxStatusLabel(status){return status==='processed'?'Processed':status==='progress'?'In progress':'New';}
@@ -1986,12 +2043,12 @@ function dataUrlByteSize(dataUrl){const base64=(dataUrl.split(',')[1]||'');retur
 function formatFileSize(bytes){return bytes>=1048576?`${(bytes/1048576).toFixed(1)} MB`:`${Math.max(1,Math.round(bytes/1024))} KB`;}
 async function prepareBrainImage(file){
  const originalData=await readFileAsDataUrl(file);const image=await loadImageFromDataUrl(originalData);
- const maxDimension=1200;const scale=Math.min(1,maxDimension/Math.max(image.naturalWidth||image.width,image.naturalHeight||image.height));
+ const maxDimension=900;const scale=Math.min(1,maxDimension/Math.max(image.naturalWidth||image.width,image.naturalHeight||image.height));
  const width=Math.max(1,Math.round((image.naturalWidth||image.width)*scale));const height=Math.max(1,Math.round((image.naturalHeight||image.height)*scale));
  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;const ctx=canvas.getContext('2d');ctx.drawImage(image,0,0,width,height);
- let quality=.76;let data=canvas.toDataURL('image/jpeg',quality);const target=360*1024;
- while(dataUrlByteSize(data)>target&&quality>.36){quality-=.07;data=canvas.toDataURL('image/jpeg',quality);}
- let size=dataUrlByteSize(data);if(size>650*1024)throw new Error('Compressed image remains too large');
+ let quality=.72;let data=canvas.toDataURL('image/jpeg',quality);const target=140*1024;
+ while(dataUrlByteSize(data)>target&&quality>.28){quality-=.06;data=canvas.toDataURL('image/jpeg',quality);}
+ let size=dataUrlByteSize(data);if(size>220*1024)throw new Error('Compressed image remains too large');
  const base=(file.name||'image').replace(/\.[^.]+$/,'');return{name:`${base}-planner.jpg`,type:'image/jpeg',size,data,originalSize:file.size,width,height,compressed:true};
 }
 function renderBrainAttachmentPreview(){const area=document.getElementById('brainAttachmentPreview');if(!area)return;const attachment=window.pendingBrainAttachment;if(!attachment){area.classList.add('hidden');area.innerHTML='';return;}const size=formatFileSize(attachment.size||0);const reduction=attachment.originalSize&&attachment.originalSize>attachment.size?` <small class="attachment-reduction">(reduced from ${formatFileSize(attachment.originalSize)})</small>`:'';const image=attachment.type?.startsWith('image/');const thumb=image?`<button type="button" class="attachment-thumb-button" onclick="showAttachmentViewer(window.pendingBrainAttachment)" aria-label="Open attached image"><img src="${attachment.data}" alt="Selected attachment preview"></button>`:`<button type="button" class="attachment-file-open" onclick="showAttachmentViewer(window.pendingBrainAttachment)"><span class="attachment-file-icon" aria-hidden="true">📄</span></button>`;area.innerHTML=`${thumb}<span><strong>${escapeHtml(attachment.name||'Attachment')}</strong><small>${size}${reduction}</small><small class="attachment-open-hint">${image?'Tap image to view':'Tap document to open'}</small></span><button type="button" onclick="removeBrainAttachment()" aria-label="Remove attachment">×</button>`;area.classList.remove('hidden');}
@@ -5585,6 +5642,14 @@ function v54apSetBackupStatus(ok,message=''){
 
 async function v54apWriteBackup(serialised=JSON.stringify(data)){
   try{
+    /* v54bs: automatic recovery must remain self-contained after Brain Inbox
+       attachment bytes moved to their own IndexedDB store. Hydrate referenced
+       attachments before snapshotting so a recovery copy contains the actual
+       image/document bytes, not only storageId references. */
+    if(typeof v54bqHydrateAllAttachments==='function'){
+      await v54bqHydrateAllAttachments(data);
+      serialised=JSON.stringify(data);
+    }
     const snapshot=v54apSnapshot(serialised);
     const db=await v54apOpenBackupDb();
     const tx=db.transaction(V54AP_BACKUP_STORE,'readwrite');
@@ -6375,28 +6440,12 @@ window.addEventListener('pageshow',()=>setTimeout(v54awAttachSearchClear,120));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)setTimeout(v54awAttachSearchClear,120);});
 
 
-/* ===== v54ax desktop updater/cache repair =====
-   Updater-only change. All v54aw planner feature code above is unchanged. */
-(function(){
-  const refreshKey=`mlp-controller-refresh-${APP_VERSION}`;
-  if(!('serviceWorker' in navigator))return;
-  function reloadOnce(){
-    try{
-      if(sessionStorage.getItem(refreshKey)==='1')return;
-      sessionStorage.setItem(refreshKey,'1');
-    }catch(_){}
-    location.reload();
-  }
-  window.addEventListener('load',async()=>{
-    try{
-      const reg=await navigator.serviceWorker.register(plannerWorkerUrl(APP_VERSION),{updateViaCache:'none'});
-      await reg.update();
-      if(reg.waiting)reg.waiting.postMessage({type:'SKIP_WAITING'});
-      navigator.serviceWorker.addEventListener('controllerchange',reloadOnce,{once:true});
-      if(!navigator.serviceWorker.controller)setTimeout(reloadOnce,500);
-    }catch(error){console.error('v54ax desktop update repair',error);}
-  },{once:true});
-})();
+/* ===== v54bq updater stabilisation =====
+   The legacy v54ax updater duplicated the authoritative updater above by
+   registering/updating the worker again and adding its own controllerchange
+   reload. On iPhone this can race with plannerReloadFresh() during an update.
+   The authoritative version-addressed updater above now owns registration,
+   activation and the single guarded reload path. */
 
 
 /* ===== v54ay Today's Progress =====
@@ -6608,3 +6657,214 @@ window.showAppView=showAppView;
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)v54bjEnforceHomeListsSeparation();});
 window.addEventListener('pageshow',v54bjEnforceHomeListsSeparation);
 setTimeout(v54bjEnforceHomeListsSeparation,250);
+
+
+/* ===== v54bm Timeline All | Schedule =====
+   Additive Timeline view only. "All" preserves the accepted Timeline renderer.
+   "Schedule" reuses the same period filters but shows only Recurring Tasks and
+   Appointments, grouped by date with recurring responsibilities first and
+   appointments beneath them in chronological order. No saved-data schema,
+   recurrence calculation, completion workflow or edit/delete action is changed. */
+var v54bmTimelineMode='all';
+const v54bmRenderTimelineAll=renderTimeline;
+function setTimelineMode(mode,button){
+  v54bmTimelineMode=mode==='schedule'?'schedule':'all';
+  document.querySelectorAll('.timeline-mode').forEach(b=>b.classList.toggle('active',b.dataset.mode===v54bmTimelineMode));
+  if(button)button.classList.add('active');
+  renderTimeline();
+}
+function v54bmScheduleItems(){return (timelineItems()||[]).filter(item=>item.type==='recurring'||item.type==='appointment');}
+function v54bmScheduleSort(a,b){
+  if(a.date!==b.date)return String(a.date).localeCompare(String(b.date));
+  const ar=a.type==='recurring'?0:1,br=b.type==='recurring'?0:1;if(ar!==br)return ar-br;
+  if(a.type==='appointment'&&b.type==='appointment'){const at=a.time||'99:99',bt=b.time||'99:99';if(at!==bt)return at.localeCompare(bt);}
+  return String(a.name||'').localeCompare(String(b.name||''));
+}
+function v54bmRenderSchedule(){
+  const area=document.getElementById('timelineArea'),summary=document.getElementById('timelineSummary');if(!area)return;
+  const {start,end}=timelineDateBounds(timelineRange),today=dateOnly(localDateKey()),allItems=v54bmScheduleItems();
+  const includeOverdue=['today','week','month','all'].includes(timelineRange);
+  const selected=allItems.filter(item=>{const d=dateOnly(item.date);return (includeOverdue&&d<today)||(d>=start&&d<=end);}).sort(v54bmScheduleSort);
+  const seen=new Set(),items=selected.filter(x=>{const k=`${x.type}:${x.id}:${x.date}`;if(seen.has(k))return false;seen.add(k);return true;});
+  area.innerHTML='';
+  const labels={today:'today including overdue',tomorrow:'tomorrow',week:'in the next 7 days including overdue',month:'this month including overdue',all:'in the next year including overdue'};
+  if(summary)summary.textContent=`Schedule: ${items.length} ${items.length===1?'item':'items'} ${labels[timelineRange]}.`;
+  if(!items.length){area.innerHTML='<div class="empty-state">No recurring tasks or appointments for this period.</div>';return;}
+  const appendRow=item=>{const type=TIMELINE_TYPES[item.type]||{icon:'•',label:'Planner item'},row=document.createElement('button');row.type='button';row.className=`timeline-item timeline-${item.type}`;row.onclick=item.open;row.innerHTML=`<span class="timeline-icon" aria-hidden="true">${type.icon}</span><span class="timeline-copy"><strong>${escapeHtml(item.name)}</strong><span class="timeline-meta">${escapeHtml(type.label)}${item.time?' · '+escapeHtml(item.time):''}${item.detail?' · '+escapeHtml(item.detail):''}</span></span><span class="timeline-chevron" aria-hidden="true">›</span>`;area.appendChild(row);};
+  let current='',lastType='';
+  items.forEach(item=>{if(item.date!==current){current=item.date;lastType='';const h=document.createElement('h3');h.className='timeline-date-heading schedule-date-heading';h.textContent=formatDate(item.date);area.appendChild(h);}if(lastType==='recurring'&&item.type==='appointment'){const gap=document.createElement('div');gap.className='schedule-group-gap';gap.setAttribute('aria-hidden','true');area.appendChild(gap);}appendRow(item);lastType=item.type;});
+}
+renderTimeline=function(){if(v54bmTimelineMode==='schedule')return v54bmRenderSchedule();return v54bmRenderTimelineAll();};
+
+
+/* ===== v54bq Brain Inbox storage repair =====
+   New photos are reduced to a safer on-device size before being embedded.
+   Brain Inbox saves are transactional: a failed storage write is rolled back
+   and the capture dialog remains open with its attachment so nothing appears
+   saved when Safari has rejected the write. Timeline v54bm is preserved. */
+
+/* ===== v54bq Attachment Storage Architecture =====
+   Attachment bytes live in IndexedDB rather than the primary localStorage JSON.
+   Planner records retain small attachment metadata + storageId references.
+   Existing embedded attachments are migrated automatically and hydrated back
+   into memory so all accepted preview/conversion workflows continue unchanged.
+   Manual Export/Share remains self-contained by embedding attachment bytes. */
+const V54BQ_ATTACHMENT_DB='MyLifePlannerAttachmentsV54bq';
+const V54BQ_ATTACHMENT_STORE='attachments';
+let v54bqAttachmentDbPromise=null;
+let v54bqAttachmentReady=false;
+
+function v54bqOpenAttachmentDb(){
+  if(v54bqAttachmentDbPromise)return v54bqAttachmentDbPromise;
+  v54bqAttachmentDbPromise=new Promise((resolve,reject)=>{
+    if(!('indexedDB' in window))return reject(new Error('IndexedDB is not available'));
+    const request=indexedDB.open(V54BQ_ATTACHMENT_DB,1);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(V54BQ_ATTACHMENT_STORE))db.createObjectStore(V54BQ_ATTACHMENT_STORE,{keyPath:'id'});
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Could not open attachment storage'));
+  });
+  return v54bqAttachmentDbPromise;
+}
+function v54bqAttachmentRecords(root=data){
+  const records=[];
+  ['inbox','todos','projects','appointments'].forEach(group=>(root?.[group]||[]).forEach(item=>{if(item?.attachment)records.push(item);}));
+  return records;
+}
+function v54bqAttachmentId(attachment){return attachment?.storageId||`att-${uid()}-${Date.now().toString(36)}`;}
+async function v54bqPutAttachment(attachment){
+  if(!attachment?.data)return attachment;
+  const id=v54bqAttachmentId(attachment),db=await v54bqOpenAttachmentDb();
+  const tx=db.transaction(V54BQ_ATTACHMENT_STORE,'readwrite');
+  tx.objectStore(V54BQ_ATTACHMENT_STORE).put({id,name:attachment.name||'Attachment',type:attachment.type||'application/octet-stream',size:attachment.size||dataUrlByteSize(attachment.data),originalSize:attachment.originalSize||0,width:attachment.width||0,height:attachment.height||0,compressed:Boolean(attachment.compressed),data:attachment.data,savedAt:new Date().toISOString()});
+  await v54apTransactionDone(tx);
+  attachment.storageId=id;
+  return attachment;
+}
+async function v54bqGetAttachment(storageId){
+  if(!storageId)return null;const db=await v54bqOpenAttachmentDb();
+  const tx=db.transaction(V54BQ_ATTACHMENT_STORE,'readonly');
+  const value=await v54apRequest(tx.objectStore(V54BQ_ATTACHMENT_STORE).get(storageId));
+  await v54apTransactionDone(tx);return value||null;
+}
+async function v54bqPersistEmbeddedAttachments(root=data){
+  for(const item of v54bqAttachmentRecords(root)){if(item.attachment?.data)await v54bqPutAttachment(item.attachment);}
+}
+async function v54bqHydrateAllAttachments(root=data){
+  for(const item of v54bqAttachmentRecords(root)){
+    const a=item.attachment;if(a?.storageId&&!a.data){const stored=await v54bqGetAttachment(a.storageId);if(stored)item.attachment={...a,...stored,storageId:a.storageId};}
+  }
+  return root;
+}
+function v54bqStripAttachment(a){if(!a)return null;if(!a.storageId)return a;const {data:ignored,...meta}=a;return meta;}
+function v54bqDataForStorage(root=data){
+  const copy=JSON.parse(JSON.stringify(root));
+  v54bqAttachmentRecords(copy).forEach(item=>{item.attachment=v54bqStripAttachment(item.attachment);});
+  return copy;
+}
+
+/* Primary planner JSON remains synchronous for the many established callers,
+   but it now contains references rather than base64 attachment payloads. */
+saveData=function(){
+  try{
+    data=normaliseData(data);validatePlannerData(data);
+    const serialised=JSON.stringify(v54bqDataForStorage(data));
+    createRecoveryCopy(serialised);
+    localStorage.setItem(DATA_KEY,serialised);
+    localStorage.setItem('lifePlannerTodayFocus',JSON.stringify(data.todayFocus||[]));
+    updateStorageStatus();showSaved();return true;
+  }catch(error){
+    console.error('Could not save planner data',error);
+    const indicator=document.getElementById('saveIndicator');if(indicator)indicator.textContent='Save failed — export a backup';
+    const quota=error?.name==='QuotaExceededError'||error?.code===22||error?.code===1014;
+    alert(quota?"This item could not be saved because Safari's planner storage is full. The item has been kept open. Please create an Export backup before deleting older items.":'The planner could not save. The item has been kept open. Please use Export backup and check that Safari is not in Private Browsing.');
+    return false;
+  }
+};
+
+/* Store a newly selected attachment before it can be committed to planner JSON. */
+const v54bqHandleBrainAttachmentBase=handleBrainAttachment;
+handleBrainAttachment=async function(event){
+  await v54bqHandleBrainAttachmentBase(event);
+  if(window.pendingBrainAttachment?.data){
+    try{await v54bqPutAttachment(window.pendingBrainAttachment);renderBrainAttachmentPreview();}
+    catch(error){console.error('Attachment storage failed',error);window.pendingBrainAttachment=null;renderBrainAttachmentPreview();alert('The attachment could not be stored safely on this device. Please try again.');}
+  }
+};
+
+async function v54bqBackupObject(){
+  await v54bqHydrateAllAttachments(data);
+  return {app:'My Life Planner',version:APP_VERSION,exportedAt:new Date().toISOString(),data:JSON.parse(JSON.stringify(data)),checks:collectChecks(),settings:getSettings()};
+}
+exportPlanner=async function(){
+  saveData();const backup=await v54bqBackupObject();
+  const blob=new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}),link=document.createElement('a');
+  link.href=URL.createObjectURL(blob);link.download=`my-life-planner-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();URL.revokeObjectURL(link.href);
+};
+sharePlannerBackup=async function(){
+  saveData();const backup=await v54bqBackupObject();
+  const file=new File([JSON.stringify(backup,null,2)],`my-life-planner-backup-${new Date().toISOString().slice(0,10)}.json`,{type:'application/json'});
+  if(navigator.canShare?.({files:[file]})){try{await navigator.share({title:'My Life Planner backup',text:'A backup of my planner information.',files:[file]});showSaved('Backup shared');return;}catch(error){if(error.name==='AbortError')return;}}
+  const blob=new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}),link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=file.name;link.click();URL.revokeObjectURL(link.href);
+};
+
+importPlanner=function(event){
+  const file=event.target.files?.[0];if(!file)return;const reader=new FileReader();
+  reader.onload=async()=>{try{
+    const raw=String(reader.result||'').replace(/^\uFEFF/,'').trim();if(!raw)throw new Error('Backup file is empty');if(raw.startsWith('PK'))throw new Error('ZIP selected instead of planner JSON backup');
+    const backup=JSON.parse(raw),imported=backup.data||backup;if(!imported||typeof imported!=='object'||Array.isArray(imported))throw new Error('Invalid backup structure');
+    data=normaliseData(imported);await v54bqPersistEmbeddedAttachments(data);await v54bqHydrateAllAttachments(data);
+    Object.entries(backup.checks||{}).forEach(([key,value])=>localStorage.setItem(key,value));if(backup.settings)localStorage.setItem(SETTINGS_KEY,JSON.stringify(backup.settings));applySettings();
+    if(saveData()===false)throw new Error('Imported planner could not be saved');renderAll();alert('Planner backup imported successfully.');
+  }catch(error){console.error('Backup import failed',error);const message=String(error?.message||'');if(message.includes('ZIP selected'))alert('That is the app ZIP, not a planner backup. Choose the .json file created by Backup / Export.');else alert('That file could not be read as a My Life Planner backup. Please choose the .json backup created by the planner.');}finally{event.target.value='';}};
+  reader.readAsText(file);
+};
+
+restoreDailyBackup=async function(dateKey){
+  if(!v54apBackupCache.length)await v54apLoadBackupCache();
+  const copy=v54apBackupCache.find(item=>item.date===dateKey);
+  if(!copy)return alert('That automatic recovery snapshot is no longer available.');
+  const label=new Date(`${dateKey}T12:00:00`).toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'});
+  if(!confirm(`Restore the recovery snapshot from ${label}? A verified safety snapshot of your current planner will be made first.`))return;
+  try{
+    const safetyOk=await v54apWriteBackup(JSON.stringify(data));
+    if(!safetyOk)throw new Error('Could not create the pre-restore safety snapshot');
+    const restored=normaliseData(JSON.parse(copy.data));
+    await v54bqPersistEmbeddedAttachments(restored);
+    await v54bqHydrateAllAttachments(restored);
+    data=restored;
+    Object.entries(copy.checks||{}).forEach(([key,value])=>localStorage.setItem(key,value));
+    if(copy.settings)localStorage.setItem(SETTINGS_KEY,JSON.stringify(copy.settings));
+    applySettings();
+    if(saveData()===false)throw new Error('Restored planner could not be saved');
+    renderAll();showSaved('Recovery snapshot restored');
+    await v54apWriteBackup(JSON.stringify(data));
+    return true;
+  }catch(error){
+    console.error('Recovery restore failed',error);
+    alert('That recovery snapshot could not be restored safely.');
+    return false;
+  }
+};
+
+const v54bqUpdateStorageStatusBase=updateStorageStatus;
+updateStorageStatus=function(){
+  v54bqUpdateStorageStatusBase();
+  const status=document.getElementById('storageStatus');if(!status)return;
+  const saved=localStorage.getItem(DATA_KEY)||'';
+  status.textContent=saved?`Planner data saved privately on this device (${Math.max(1,Math.round(new Blob([saved]).size/1024))} KB) · attachments stored separately in protected on-device storage.`:'No planner information has been saved yet.';
+};
+
+async function v54bqInitialiseAttachmentStorage(){
+  try{
+    if(navigator.storage?.persist)try{await navigator.storage.persist();}catch(_){}
+    await v54bqPersistEmbeddedAttachments(data);
+    await v54bqHydrateAllAttachments(data);
+    /* Once every embedded payload has a verified IndexedDB reference, rewrite
+       the primary JSON without those large base64 strings. */
+    saveData();v54bqAttachmentReady=true;renderAll();updateStorageStatus();
+  }catch(error){console.error('Attachment storage initialisation failed',error);}
+}
+setTimeout(()=>{void v54bqInitialiseAttachmentStorage();},300);
